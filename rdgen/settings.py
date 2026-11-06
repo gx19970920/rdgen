@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.0/ref/settings/
 """
 import os
+import secrets
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -20,15 +21,20 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get('SECRET_KEY','django-insecure-!(t-!f#6g#sr%yfded9(xha)g+=!6craeez^cp+*&bz_7vdk61')
+SECRET_KEY = os.environ.get('SECRET_KEY') or secrets.token_urlsafe(64)
 GHUSER = os.environ.get("GHUSER", '')
 GHBEARER = os.environ.get("GHBEARER", '')
 GENURL = os.environ.get("GENURL", '')
 GHBRANCH = os.environ.get("GHBRANCH",'master')
-ZIP_PASSWORD = os.environ.get("ZIP_PASSWORD",'insecure')
+ZIP_PASSWORD = os.environ.get("ZIP_PASSWORD", '')
+CALLBACK_TOKEN = os.environ.get('CALLBACK_TOKEN') or ZIP_PASSWORD
 PROTOCOL = os.environ.get("PROTOCOL", 'https')
 REPONAME = os.environ.get("REPONAME", 'rdgen')
-SH_SECRET = os.environ.get('SH_SECRET', 'secret')
+SH_SECRET = os.environ.get('SH_SECRET', '')
+WEBDAV_URL = os.environ.get('WEBDAV_URL', '')
+WEBDAV_USER = os.environ.get('WEBDAV_USER', '')
+WEBDAV_PASS = os.environ.get('WEBDAV_PASS', '')
+WEBDAV_DIR = os.environ.get('WEBDAV_DIR', '')
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
@@ -38,8 +44,29 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 DEBUG_ENV = os.environ.get("DEBUG", "False")
 DEBUG = DEBUG_ENV.lower() in ['true', '1', 't']
 
-ALLOWED_HOSTS = ['*']
-#CSRF_TRUSTED_ORIGINS = os.getenv('CSRF_TRUSTED_ORIGINS', '').split()
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get('ALLOWED_HOSTS', '*').split(',')
+    if host.strip()
+]
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get('CSRF_TRUSTED_ORIGINS', '').split(',')
+    if origin.strip()
+]
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+SESSION_COOKIE_SECURE = PROTOCOL == 'https'
+CSRF_COOKIE_SECURE = PROTOCOL == 'https'
+SECURE_SSL_REDIRECT = os.environ.get('SECURE_SSL_REDIRECT', 'False').lower() in {
+    'true', '1', 't', 'yes'
+}
+SECURE_HSTS_SECONDS = int(os.environ.get('SECURE_HSTS_SECONDS', '0'))
+SECURE_HSTS_INCLUDE_SUBDOMAINS = os.environ.get(
+    'SECURE_HSTS_INCLUDE_SUBDOMAINS', 'False'
+).lower() in {'true', '1', 't', 'yes'}
+SECURE_HSTS_PRELOAD = os.environ.get('SECURE_HSTS_PRELOAD', 'False').lower() in {
+    'true', '1', 't', 'yes'
+}
 
 # Application definition
 
@@ -57,7 +84,7 @@ MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
-    #'django.middleware.csrf.CsrfViewMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
@@ -144,4 +171,19 @@ STATIC_URL = 'static/'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-DATA_UPLOAD_MAX_MEMORY_SIZE = None
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(
+    os.environ.get('DATA_UPLOAD_MAX_MEMORY_SIZE', str(16 * 1024 * 1024))
+)
+FILE_UPLOAD_MAX_MEMORY_SIZE = int(
+    os.environ.get('FILE_UPLOAD_MAX_MEMORY_SIZE', str(10 * 1024 * 1024))
+)
+MAX_IMAGE_UPLOAD_BYTES = int(
+    os.environ.get('MAX_IMAGE_UPLOAD_BYTES', str(10 * 1024 * 1024))
+)
+MAX_IMAGE_PIXELS = int(os.environ.get('MAX_IMAGE_PIXELS', str(16 * 1024 * 1024)))
+MAX_BUILD_UPLOAD_BYTES = int(
+    os.environ.get('MAX_BUILD_UPLOAD_BYTES', str(512 * 1024 * 1024))
+)
+DB_PATH = os.environ.get('DB_PATH')
+if DB_PATH:
+    DATABASES['default']['NAME'] = DB_PATH

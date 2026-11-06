@@ -1,0 +1,9 @@
+[Unit]
+Description=Reload RustDesk distribution TLS certificate
+After=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/rdgen-distribution/proxy.env
+ExecStart=/usr/bin/python3 /opt/rdgen-distribution/refresh_cert.py
+ExecStart=/usr/bin/docker exec rdgen-distribution-proxy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile --address 127.0.0.1:12019 --force

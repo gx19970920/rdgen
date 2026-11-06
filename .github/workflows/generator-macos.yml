@@ -1,5 +1,8 @@
 name: Custom macOS Client Generator
 run-name: Custom macOS Client Generator
+permissions:
+  actions: write
+  contents: write
 on: 
   workflow_dispatch:
     inputs:
@@ -13,6 +16,21 @@ on:
         required: true
         default: ''
         type: string
+      zip_b64:
+        description: 'base64 encoded encrypted input bundle'
+        required: false
+        default: ''
+        type: string
+      bundle_asset_id:
+        description: 'private GitHub release asset ID for encrypted inputs'
+        required: false
+        default: ''
+        type: string
+      verify_only:
+        description: 'Build a synthetic client without callbacks, NAS upload or notifications'
+        type: boolean
+        required: false
+        default: false
       app_version:
         description: 'custom app version string (overrides build version)'
         required: false
@@ -31,7 +49,6 @@ env:
   ANDROID_FLUTTER_VERSION: "3.24.5" # >= 3.16 is very slow on my android phone, but work well on most of others. We may switch to new flutter after changing to texture rendering (I believe it can solve my problem).
   FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"  # for arm64 linux because official Dart SDK does not work
   FLUTTER_ELINUX_VERSION: "3.16.9"
-  TAG_NAME: "${{ inputs.upload-tag }}"
   VCPKG_BINARY_SOURCES: "clear"
   # vcpkg version: 2024.07.12
   VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
@@ -43,12 +60,21 @@ env:
   MACOS_P12_BASE64: "${{ secrets.MACOS_P12_BASE64 }}"
   UPLOAD_ARTIFACT: 'true'
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}"
+  WEBDAV_URL: "${{ secrets.WEBDAV_URL }}"
+  WEBDAV_USER: "${{ secrets.WEBDAV_USER }}"
+  WEBDAV_PASS: "${{ secrets.WEBDAV_PASS }}"
+  WEBDAV_DIR: "${{ secrets.WEBDAV_DIR }}"
 
 jobs:
   setup:
     uses: ./.github/workflows/fetch-encrypted-secrets.yml
     with:
       zip_url_json: ${{ inputs.zip_url }}
+      zip_b64: ${{ inputs.zip_b64 }}
+      bundle_asset_id: ${{ inputs.bundle_asset_id }}
+      verify_only: ${{ inputs.verify_only }}
+    secrets:
+      ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
 
   generate-bridge:
     uses: ./.github/workflows/bridge.yml
@@ -72,7 +98,7 @@ jobs:
             }
           - {
               target: aarch64-apple-darwin,
-              os: macos-14,
+              os: macos-15,
               # extra-build-args: "--disable-flutter-texture-render", # disable this for mac, because we see a lot of users reporting flickering both on arm and x64, and we can not confirm if texture rendering has better performance if htere is no vram, https://github.com/rustdesk/rustdesk/issues/6296
               extra-build-args: "--screencapturekit",
               arch: aarch64,
@@ -95,17 +121,17 @@ jobs:
           zip_password: ${{ secrets.ZIP_PASSWORD }}
 
       - name: Finalize and Cleanup zip/json
-        if: always() # Run even if previous steps fail
+        if: always() && env.rdgen != 'verify' && env.genurl != ''
         continue-on-error: true
         uses: fjogeleit/http-request-action@v1
         with:
-          url: "${{ secrets.GENURL }}/cleanzip"
+          url: "${{ env.genurl }}/cleanzip"
           method: 'POST'
-          customHeaders: '{"Content-Type": "application/json"}'
+          customHeaders: '{"Content-Type": "application/json", "Authorization": "Bearer ${{ env.CALLBACK_TOKEN }}"}'
           data: '{"uuid": "${{ env.uuid }}"}'
 
       - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
@@ -140,7 +166,7 @@ jobs:
         if: ${{ env.update_public_key != '' }}
         shell: bash
         run: |
-          curl -sSL -o allow_custom_update.py https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/allow_custom_update.py
+          python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'allow_custom_update.py'), 'allow_custom_update.py')"
           python3 allow_custom_update.py \
             --rustdesk-root . \
             --update-url "${{ env.downloadLink}}/api/version/latest" \
@@ -157,9 +183,9 @@ jobs:
         shell: bash
         run: |
           # MACSTUFF Update Info.plist
-          sed -i '' -e 's|<key>CFBundleName</key>.*<string>.*</string>|<key>CFBundleName</key>\n\t<string>${{ env.appname }}</string>|' ./flutter/macos/Runner/Info.plist
-          sed -i '' -e 's|<key>CFBundleDisplayName</key>.*<string>.*</string>|<key>CFBundleDisplayName</key>\n\t<string>${{ env.appname }}</string>|' ./flutter/macos/Runner/Info.plist
-          sed -i '' -e 's|<key>CFBundleIdentifier</key>.*<string>.*</string>|<key>CFBundleIdentifier</key>\n\t<string>com.${{ env.appname }}.app</string>|' ./flutter/macos/Runner/Info.plist
+          sed -i '' -e 's|<key>CFBundleName</key>.*<string>.*</string>|<key>CFBundleName</key>\r\n\t<string>${{ env.appname }}</string>|' ./flutter/macos/Runner/Info.plist
+          sed -i '' -e 's|<key>CFBundleDisplayName</key>.*<string>.*</string>|<key>CFBundleDisplayName</key>\r\n\t<string>${{ env.appname }}</string>|' ./flutter/macos/Runner/Info.plist
+          sed -i '' -e 's|<key>CFBundleIdentifier</key>.*<string>.*</string>|<key>CFBundleIdentifier</key>\r\n\t<string>com.${{ env.appname }}.app</string>|' ./flutter/macos/Runner/Info.plist
           
           # MACSTUFF Update AppInfo.xcconfig
           sed -i '' -e 's|PRODUCT_NAME = .*|PRODUCT_NAME = ${{ env.appname }}|' ./flutter/macos/Runner/Configs/AppInfo.xcconfig
@@ -229,11 +255,10 @@ jobs:
           rm ./flutter/temp_dependency.txt 
 
       - name: set server, serverPort, key, and apiserver
-        continue-on-error: true
         shell: bash
         env:
           SERVER_DOMAIN: ${{ env.server }}
-          SERVER_PORT_INPUT: ${{ env.serverPort }}
+          SERVER_PORT_INPUT: ${{ env.serverPort || '21116' }}
           SERVER_KEY: ${{ env.key }}
           API_SERVER: ${{ env.apiServer }}
         run: |
@@ -285,9 +310,9 @@ jobs:
           retry_wait_seconds: 15
           shell: bash
           command: |
-            wget https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/allowCustom.py
+            python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'allowCustom.py'), 'allowCustom.py')"
             python allowCustom.py
-            wget https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/removeSetupServerTip.diff
+            python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'removeSetupServerTip.diff'), 'removeSetupServerTip.diff')"
             git apply removeSetupServerTip.diff
             # sed -i '/intl:/a \ \ archive: ^3.6.1' ./flutter/pubspec.yaml
           
@@ -504,25 +529,24 @@ jobs:
         continue-on-error: true
         if: env.xOffline == 'true'
         run: |
-          wget https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/xoffline.diff
+          python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'xoffline.diff'), 'xoffline.diff')"
           git apply xoffline.diff
 
       - name: hide-cm
         continue-on-error: true
         if: env.hidecm == 'true'
         run: |
-          wget https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/hidecm.diff
+          python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'hidecm.diff'), 'hidecm.diff')"
           git apply hidecm.diff
 
       - name: removeNewVersionNotif
-        continue-on-error: true
         if: env.removeNewVersionNotif == 'true'
         run: | 
           sed -i -e 's|updateUrl.isNotEmpty|false|' ./flutter/lib/desktop/pages/desktop_home_page.dart
-          #sed -i '/let (request, url) =/,/Ok(())/{/Ok(())/!d}' ./src/common.rs
+          python -c "import os, runpy; runpy.run_path(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'disable_update_check.py'), run_name='__main__')"
 
       - name: Restore bridge files
-        uses: actions/download-artifact@master
+        uses: actions/download-artifact@v4
         with:
           name: bridge-artifact
           path: ./
@@ -604,7 +628,7 @@ jobs:
 
       - name: Install build runtime
         run: |
-          brew install llvm create-dmg nasm cmake gcc wget ninja
+          brew install llvm create-dmg cmake gcc wget ninja
           # pkg-config is handled in a separate step, because it may be already installed by `macos-latest`(14.7.1) runner
           if command -v pkg-config &>/dev/null; then
               echo "pkg-config is already installed"
@@ -784,16 +808,34 @@ jobs:
             exit 1
           fi
 
+      - name: Preserve verification packages
+        if: inputs.verify_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-macos-${{ matrix.job.arch }}
+          path: ./${{ env.filename }}-${{ matrix.job.arch }}.dmg
+          if-no-files-found: error
+          retention-days: 7
+
       - name: send file to rdgen server
         if: ${{ env.rdgen == 'true' }}
         shell: bash
         run: |
-          curl -i -X POST \
+          curl --fail-with-body -i -X POST \
             -H "Content-Type: multipart/form-data" \
-            -H "Authorization: Bearer ${{ env.token }}" \
+            -H "Authorization: Bearer ${{ env.CALLBACK_TOKEN }}" \
             -F "file=@$GITHUB_WORKSPACE/${{ env.filename }}-${{ matrix.job.arch }}.dmg" \
             -F "uuid=${{ env.uuid }}" \
-            "${{ secrets.GENURL }}/save_custom_client"
+            "${{ env.genurl }}/save_custom_client"
+
+      - name: upload to Synology WebDAV
+        if: ${{ env.rdgen == 'true' && env.WEBDAV_URL != '' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          python "$RDGEN_ASSET_DIR/upload_webdav.py" \
+            --upload "$GITHUB_WORKSPACE/${{ env.filename }}-${{ matrix.job.arch }}.dmg" \
+            "${{ env.filename }}-${{ env.VERSION }}-macos-${{ matrix.job.arch }}.dmg"
         
 
       - name: send file to api server
@@ -809,10 +851,30 @@ jobs:
   cleanup:
     needs: [build-for-macos]
     runs-on: ubuntu-latest
-    continue-on-error: true
     if: always()
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Delete private input bundle asset
+        if: ${{ inputs.bundle_asset_id != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${{ inputs.bundle_asset_id }}"
       - name: Delete secrets artifact
         uses: geekyeggo/delete-artifact@v5
         with:
           name: encrypted-secrets-zip
+      - name: Notify WeCom
+        if: always() && !inputs.verify_only
+        continue-on-error: true
+        uses: ./.github/actions/notify-wecom
+        with:
+          platform: macOS
+          version: ${{ inputs.version }}
+          status: ${{ needs.build-for-macos.result == 'success' && 'success' || 'failure' }}
+        env:
+          WECHAT_WORK_CORP_ID: ${{ secrets.WECHAT_WORK_CORP_ID }}
+          WECHAT_WORK_AGENT_ID: ${{ secrets.WECHAT_WORK_AGENT_ID }}
+          WECHAT_WORK_SECRET: ${{ secrets.WECHAT_WORK_SECRET }}
+          WECHAT_WORK_TOUSER: ${{ secrets.WECHAT_WORK_TOUSER }}

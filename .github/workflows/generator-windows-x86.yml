@@ -1,5 +1,8 @@
 name: Custom Windows x86 Client Generator
 run-name: Custom Windows x86 Client Generator
+permissions:
+  actions: write
+  contents: write
 on: 
   workflow_dispatch:
     inputs:
@@ -13,6 +16,21 @@ on:
         required: true
         default: ''
         type: string
+      zip_b64:
+        description: 'base64 encoded encrypted input bundle'
+        required: false
+        default: ''
+        type: string
+      bundle_asset_id:
+        description: 'private GitHub release asset ID for encrypted inputs'
+        required: false
+        default: ''
+        type: string
+      verify_only:
+        description: 'Build a synthetic client without callbacks, NAS upload or notifications'
+        type: boolean
+        required: false
+        default: false
       app_version:
         description: 'custom app version string (overrides build version)'
         required: false
@@ -31,7 +49,6 @@ env:
   ANDROID_FLUTTER_VERSION: "3.24.5"
   # for arm64 linux because official Dart SDK does not work
   FLUTTER_ELINUX_VERSION: "3.16.9"
-  TAG_NAME: "${{ inputs.upload-tag }}"
   VCPKG_BINARY_SOURCES: "clear"
   # vcpkg version: 2025.08.27
   # If we change the `VCPKG COMMIT_ID`, please remember:
@@ -48,6 +65,10 @@ env:
   MACOS_P12_BASE64: "${{ secrets.MACOS_P12_BASE64 }}"
   UPLOAD_ARTIFACT: 'true'
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}"
+  WEBDAV_URL: "${{ secrets.WEBDAV_URL }}"
+  WEBDAV_USER: "${{ secrets.WEBDAV_USER }}"
+  WEBDAV_PASS: "${{ secrets.WEBDAV_PASS }}"
+  WEBDAV_DIR: "${{ secrets.WEBDAV_DIR }}"
   STATUS_URL: "${{ secrets.GENURL }}/updategh"
 
 jobs:
@@ -55,6 +76,11 @@ jobs:
     uses: ./.github/workflows/fetch-encrypted-secrets.yml
     with:
       zip_url_json: ${{ inputs.zip_url }}
+      zip_b64: ${{ inputs.zip_b64 }}
+      bundle_asset_id: ${{ inputs.bundle_asset_id }}
+      verify_only: ${{ inputs.verify_only }}
+    secrets:
+      ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
 
   build-for-windows-sciter:
     name: ${{ matrix.job.target }} (${{ matrix.job.os }})
@@ -89,17 +115,17 @@ jobs:
           zip_password: ${{ secrets.ZIP_PASSWORD }}
 
       - name: Finalize and Cleanup zip/json
-        if: always() # Run even if previous steps fail
+        if: always() && env.rdgen != 'verify' && env.genurl != ''
         continue-on-error: true
         uses: fjogeleit/http-request-action@v1
         with:
-          url: "${{ secrets.GENURL }}/cleanzip"
+          url: "${{ env.genurl }}/cleanzip"
           method: 'POST'
-          customHeaders: '{"Content-Type": "application/json"}'
+          customHeaders: '{"Content-Type": "application/json", "Authorization": "Bearer ${{ env.CALLBACK_TOKEN }}"}'
           data: '{"uuid": "${{ env.uuid }}"}'
 
       - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
@@ -144,7 +170,7 @@ jobs:
         if: ${{ env.update_public_key != '' }}
         shell: bash
         run: |
-          curl -sSL -o allow_custom_update.py https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/allow_custom_update.py
+          python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'allow_custom_update.py'), 'allow_custom_update.py')"
           python3 allow_custom_update.py \
             --rustdesk-root . \
             --update-url "${{ env.downloadLink}}/api/version/latest" \
@@ -228,11 +254,10 @@ jobs:
           sed -i -e 's|&download_url|"${{ env.downloadLink }}"|' ./src/updater.rs
 
       - name: set server, serverPort, key, and apiserver
-        continue-on-error: true
         shell: bash
         env:
           SERVER_DOMAIN: ${{ env.server }}
-          SERVER_PORT_INPUT: ${{ env.serverPort }}
+          SERVER_PORT_INPUT: ${{ env.serverPort || '21116' }}
           SERVER_KEY: ${{ env.key }}
           API_SERVER: ${{ env.apiServer }}
         run: |
@@ -286,7 +311,7 @@ jobs:
           shell: pwsh
           continue_on_error: true
           command: |
-            Invoke-WebRequest -Uri https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/allowCustom.diff -OutFile allowCustom.diff
+            python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'allowCustom.diff'), 'allowCustom.diff')"
             git apply allowCustom.diff
 
       - name: Install LLVM and Clang
@@ -412,12 +437,11 @@ jobs:
           grep -n "key.is_empty()" ./src/client.rs || true
 
       - name: removeNewVersionNotif
-        continue-on-error: true
         if: env.removeNewVersionNotif == 'true'
         shell: bash
         run: | 
           sed -i -e 's|{software_update_url ? <UpdateMe /> : ""}||' ./src/ui/index.tis
-          #sed -i '/let (request, url) =/,/Ok(())/{/Ok(())/!d}' ./src/common.rs
+          python -c "import os, runpy; runpy.run_path(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'disable_update_check.py'), run_name='__main__')"
 
       - name: Build rustdesk
         id: build
@@ -458,10 +482,10 @@ jobs:
                       sep = '' if inner.strip() == '' else ', '
                       sec = sec[:rm.start(1)] + inner + sep + entry + sec[rm.end(1):]
                   else:
-                      sec = sec + f'rustflags = [{entry}]\n'
+                      sec = sec + f'rustflags = [{entry}]\r\n'
                   s = s[:m.start(1)] + sec + s[m.end(1):]
               else:
-                  s += f'\n[target.i686-pc-windows-msvc]\nrustflags = [{entry}]\n'
+                  s += f'\r\n[target.i686-pc-windows-msvc]\r\nrustflags = [{entry}]\r\n'
               open(p, 'w', encoding='utf-8').write(s)
               print('sodium Win32 -L injected')
           PYEOF
@@ -577,11 +601,27 @@ jobs:
         run: |
           mv ./SignOutput/rustdesk.exe "./SignOutput/${{ env.filename }}.exe" || echo "rustdesk"
 
+      - name: Upload Windows x86 artifact
+        if: ${{ env.rdgen == 'true' || inputs.verify_only }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.filename }}-${{ env.VERSION }}-windows-x86
+          path: ./SignOutput/${{ env.filename }}.exe
+          if-no-files-found: error
+
       - name: send file to rdgen server
         if: ${{ env.rdgen == 'true' }}
         shell: bash
         run: |
-          curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./SignOutput/${{ env.filename }}.exe" -F "uuid=${{ env.uuid }}" ${{ secrets.GENURL }}/save_custom_client
+          curl --fail-with-body -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.CALLBACK_TOKEN }}" -F "file=@./SignOutput/${{ env.filename }}.exe" -F "uuid=${{ env.uuid }}" ${{ env.genurl }}/save_custom_client
+
+      - name: Upload Windows x86 executable to Synology WebDAV
+        if: ${{ env.rdgen == 'true' && env.WEBDAV_URL != '' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          python "$RDGEN_ASSET_DIR/upload_webdav.py" \
+            --upload "./SignOutput/${{ env.filename }}.exe" "${{ env.filename }}-${{ env.VERSION }}-windows-x86.exe"
 
       - name: send file to api server
         if: ${{ env.rdgen == 'false' }}
@@ -592,10 +632,30 @@ jobs:
   cleanup:
     needs: [build-for-windows-sciter]
     runs-on: ubuntu-latest
-    continue-on-error: true
     if: always()
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Delete private input bundle asset
+        if: ${{ inputs.bundle_asset_id != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${{ inputs.bundle_asset_id }}"
       - name: Delete secrets artifact
         uses: geekyeggo/delete-artifact@v5
         with:
           name: encrypted-secrets-zip
+      - name: Notify WeCom
+        if: always() && !inputs.verify_only
+        continue-on-error: true
+        uses: ./.github/actions/notify-wecom
+        with:
+          platform: Windows x86
+          version: ${{ inputs.version }}
+          status: ${{ needs.build-for-windows-sciter.result == 'success' && 'success' || 'failure' }}
+        env:
+          WECHAT_WORK_CORP_ID: ${{ secrets.WECHAT_WORK_CORP_ID }}
+          WECHAT_WORK_AGENT_ID: ${{ secrets.WECHAT_WORK_AGENT_ID }}
+          WECHAT_WORK_SECRET: ${{ secrets.WECHAT_WORK_SECRET }}
+          WECHAT_WORK_TOUSER: ${{ secrets.WECHAT_WORK_TOUSER }}

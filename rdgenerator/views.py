@@ -1,6 +1,17 @@
 import io
+import mimetypes
 from pathlib import Path
-from django.http import HttpResponse, JsonResponse, HttpResponseForbidden
+import shutil
+import tempfile
+import zipfile
+from django.http import (
+    FileResponse,
+    HttpResponse,
+    HttpResponseBadRequest,
+    HttpResponseForbidden,
+    HttpResponseNotFound,
+    JsonResponse,
+)
 from django.shortcuts import render, get_object_or_404
 from django.core.files.base import ContentFile
 import os
@@ -13,22 +24,238 @@ import uuid
 import pyzipper
 from django.conf import settings as _settings
 from django.db.models import Q
+from django.views.decorators.csrf import csrf_exempt
 from .forms import GenerateForm
+from .build_validation import build_parameter_error
 from .models import GithubRun
 from PIL import Image
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 
-# get_png, download and save_custom_client build file paths from request values;
-# only accept a UUID and a plain file name so "../" or absolute paths cannot escape png/ and exe/.
-_UUID_RE = re.compile(r'^[0-9a-fA-F-]{36}$')
-_NAME_RE = re.compile(r'^[\w.-]+$')
 
-def _safe_parts(uuid_val, filename):
-    if not uuid_val or not _UUID_RE.match(uuid_val):
+WORKFLOW_BY_PLATFORM = {
+    'windows': 'generator-windows.yml',
+    'windows-x86': 'generator-windows-x86.yml',
+    'linux': 'generator-linux.yml',
+    'android': 'generator-android.yml',
+    'macos': 'generator-macos.yml',
+}
+
+TRANSIENT_INPUT_TAG = 'rdgen-inputs'
+
+
+def _public_base_url(request):
+    configured_url = _settings.GENURL.strip().rstrip('/')
+    if configured_url:
+        return configured_url
+    return request.build_absolute_uri('/').rstrip('/')
+
+
+def _is_selfhosted_request(user_secret):
+    configured_secret = str(_settings.SH_SECRET or '')
+    supplied_secret = str(user_secret or '')
+    return bool(
+        configured_secret
+        and supplied_secret
+        and secrets.compare_digest(configured_secret, supplied_secret)
+    )
+
+
+def _callback_is_authorized(request):
+    configured_token = str(_settings.CALLBACK_TOKEN or '')
+    if not configured_token:
         return False
-    if filename is not None and (not _NAME_RE.match(filename) or filename.startswith('.')):
-        return False
-    return True
+    authorization = request.headers.get('Authorization', '')
+    scheme, _, supplied_token = authorization.partition(' ')
+    return bool(
+        scheme.lower() == 'bearer'
+        and supplied_token
+        and secrets.compare_digest(configured_token, supplied_token)
+    )
+
+
+def _github_headers(accept='application/vnd.github+json'):
+    return {
+        'Accept': accept,
+        'Authorization': f'Bearer {_settings.GHBEARER}',
+        'X-GitHub-Api-Version': '2026-03-10',
+    }
+
+
+def _workflow_dispatch_url(platform, selfhosted=False):
+    workflow = WORKFLOW_BY_PLATFORM.get(platform, WORKFLOW_BY_PLATFORM['windows'])
+    if platform == 'windows' and selfhosted:
+        workflow = 'sh-generator-windows.yml'
+    return (
+        f'https://api.github.com/repos/{_settings.GHUSER}/{_settings.REPONAME}'
+        f'/actions/workflows/{workflow}/dispatches'
+    )
+
+
+def _get_or_create_transient_release():
+    base_url = f'https://api.github.com/repos/{_settings.GHUSER}/{_settings.REPONAME}'
+    response = requests.get(
+        f'{base_url}/releases/tags/{TRANSIENT_INPUT_TAG}',
+        headers=_github_headers(),
+        timeout=30,
+    )
+    if response.status_code == 200:
+        return response.json()
+    if response.status_code != 404:
+        response.raise_for_status()
+
+    response = requests.post(
+        f'{base_url}/releases',
+        headers=_github_headers(),
+        json={
+            'tag_name': TRANSIENT_INPUT_TAG,
+            'target_commitish': _settings.GHBRANCH,
+            'name': 'RDGen transient build inputs',
+            'body': 'Encrypted, short-lived build inputs created by RDGen.',
+            'prerelease': True,
+        },
+        timeout=30,
+    )
+    if response.status_code == 422:
+        # Another request may have created the singleton release concurrently.
+        response = requests.get(
+            f'{base_url}/releases/tags/{TRANSIENT_INPUT_TAG}',
+            headers=_github_headers(),
+            timeout=30,
+        )
+    response.raise_for_status()
+    return response.json()
+
+
+def _upload_input_bundle(zip_path, zip_filename):
+    """Upload a private, encrypted build bundle and return its release asset ID."""
+    release = _get_or_create_transient_release()
+    upload_url = release['upload_url'].split('{', 1)[0]
+    with open(zip_path, 'rb') as bundle:
+        response = requests.post(
+            upload_url,
+            params={'name': zip_filename},
+            headers=_github_headers('application/vnd.github+json') | {
+                'Content-Type': 'application/zip'
+            },
+            data=bundle,
+            timeout=(15, 120),
+        )
+    response.raise_for_status()
+    return response.json()['id']
+
+
+def _delete_input_bundle(asset_id):
+    if not asset_id:
+        return
+    url = (
+        f'https://api.github.com/repos/{_settings.GHUSER}/{_settings.REPONAME}'
+        f'/releases/assets/{asset_id}'
+    )
+    try:
+        response = requests.delete(url, headers=_github_headers(), timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        print(f'Failed to delete transient GitHub input bundle {asset_id}: {exc}')
+
+
+def _download_artifact_file(run_id, filename):
+    """Return a spooled file extracted from a matching Actions artifact."""
+    artifacts_url = (
+        f'https://api.github.com/repos/{_settings.GHUSER}/{_settings.REPONAME}'
+        f'/actions/runs/{run_id}/artifacts?per_page=100'
+    )
+    response = requests.get(artifacts_url, headers=_github_headers(), timeout=30)
+    response.raise_for_status()
+    artifacts = [
+        artifact
+        for artifact in response.json().get('artifacts', [])
+        if not artifact.get('expired')
+    ]
+    filename_key = Path(filename).stem.lower()
+    preferred = [
+        artifact for artifact in artifacts
+        if filename_key in artifact.get('name', '').lower()
+    ]
+    candidates = preferred or artifacts
+
+    for artifact in candidates:
+        archive_url = artifact.get('archive_download_url')
+        if not archive_url:
+            continue
+        archive_response = requests.get(
+            archive_url,
+            headers=_github_headers(),
+            stream=True,
+            timeout=(15, 180),
+        )
+        archive_response.raise_for_status()
+        with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024) as archive:
+            for chunk in archive_response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    archive.write(chunk)
+            archive.seek(0)
+            try:
+                with zipfile.ZipFile(archive) as bundle:
+                    member = next(
+                        (
+                            info for info in bundle.infolist()
+                            if not info.is_dir() and Path(info.filename).name == filename
+                        ),
+                        None,
+                    )
+                    if member is None:
+                        continue
+                    if member.file_size > _settings.MAX_BUILD_UPLOAD_BYTES:
+                        print(
+                            f'Ignoring oversized artifact member {member.filename} '
+                            f'({member.file_size} bytes)'
+                        )
+                        continue
+                    output = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024)
+                    with bundle.open(member) as source:
+                        shutil.copyfileobj(source, output, length=1024 * 1024)
+                    output.seek(0)
+                    return output
+            except zipfile.BadZipFile:
+                continue
+    return None
+
+
+def _list_run_artifact_files(run_id):
+    """Return safe basenames from downloadable artifacts for a completed run."""
+    artifacts_url = (
+        f'https://api.github.com/repos/{_settings.GHUSER}/{_settings.REPONAME}'
+        f'/actions/runs/{run_id}/artifacts?per_page=100'
+    )
+    response = requests.get(artifacts_url, headers=_github_headers(), timeout=30)
+    response.raise_for_status()
+    filenames = set()
+    for artifact in response.json().get('artifacts', []):
+        if artifact.get('expired') or not artifact.get('archive_download_url'):
+            continue
+        archive_response = requests.get(
+            artifact['archive_download_url'],
+            headers=_github_headers(),
+            stream=True,
+            timeout=(15, 180),
+        )
+        archive_response.raise_for_status()
+        with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024) as archive:
+            for chunk in archive_response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    archive.write(chunk)
+            archive.seek(0)
+            try:
+                with zipfile.ZipFile(archive) as bundle:
+                    for member in bundle.infolist():
+                        if member.is_dir():
+                            continue
+                        filename = Path(member.filename.replace('\\', '/')).name
+                        if filename and filename not in {'.', '..'}:
+                            filenames.add(filename)
+            except zipfile.BadZipFile:
+                continue
+    return sorted(filenames)
 
 
 def generate_custom_client(params, full_url):
@@ -43,8 +270,20 @@ def generate_custom_client(params, full_url):
         dict with 'success' key. On success: also includes 'uuid', 'filename', 'platform', 'log_url'.
         On failure: includes 'error' and optionally 'status_code'.
     """
+    for field, value in params.items():
+        error = build_parameter_error(field, value)
+        if error:
+            return {'success': False, 'error': f'{field}: {error}', 'status_code': 400}
+
+    if not _settings.ZIP_PASSWORD:
+        return {
+            'success': False,
+            'error': 'Server ZIP_PASSWORD is not configured',
+            'status_code': 503,
+        }
+
     user_secret = params.get('sh_secret_field', '')
-    selfhosted = (_settings.SH_SECRET == user_secret)
+    selfhosted = _is_selfhosted_request(user_secret)
     platform = params.get('platform', 'windows')
     version = params.get('version', '1.5.1')
     app_version = params.get('app_version', '')
@@ -55,22 +294,13 @@ def generate_custom_client(params, full_url):
     xOffline = params.get('xOffline', False)
     hidecm = params.get('hidecm', False)
     removeNewVersionNotif = params.get('removeNewVersionNotif', False)
-    update_public_key = params.get('update_public_key', '')
-    # If a custom update public key is provided, force the "remove new version
-    # notification" behaviour off so the client keeps checking for updates via
-    # the self-hosted update URL instead.
-    if update_public_key:
-        removeNewVersionNotif = False
     server = params.get('serverIP', '')
-    serverPort = params.get('serverPort', '')
     key = params.get('key', '')
     apiServer = params.get('apiServer', '')
     urlLink = params.get('urlLink', '')
     downloadLink = params.get('downloadLink', '')
     if not server:
         server = 'rs-ny.rustdesk.com' #default rustdesk server
-    if not serverPort:
-        serverPort = '21116' #default rustdesk rendezvous port
     if not key:
         key = 'OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=' #default rustdesk key
     if not apiServer:
@@ -82,10 +312,8 @@ def generate_custom_client(params, full_url):
     direction = params.get('direction', 'both')
     installation = params.get('installation', 'installationY')
     settings = params.get('settings', 'settingsY')
-    appname_display = params.get('appname', '')
-    if not appname_display:
-        appname_display = "rustdesk"
-    appname = re.sub(r"[:|\\/]", "", appname_display).replace(" ", "")
+    appname_display = params.get('appname', '') or 'rustdesk'
+    appname = re.sub(r"[:|\\/]", "", appname_display).replace(" ", "") or 'rustdesk'
     filename = params.get('exename', 'rustdesk')
     compname = params.get('compname', '')
     if not compname:
@@ -124,8 +352,12 @@ def generate_custom_client(params, full_url):
         filename = filename.replace(" ","_")
     else:
         filename = "rustdesk"
+    if not filename or not re.search(r'[A-Za-z0-9]', filename):
+        filename = "rustdesk"
     if not all(char.isascii() for char in appname):
         appname = "rustdesk"
+    if platform == "linux":
+        appname = appname.lower()
     myuuid = str(uuid.uuid4())
 
     try:
@@ -133,8 +365,8 @@ def generate_custom_client(params, full_url):
         if not iconfile:
             iconfile = params.get('iconbase64')
         iconlink_url, iconlink_uuid, iconlink_file = save_png(iconfile,myuuid,full_url,"icon.png")
-    except:
-        print("failed to get icon, using default")
+    except (ValueError, OSError) as exc:
+        print(f"failed to get icon, using default: {exc}")
         iconlink_url = "false"
         iconlink_uuid = "false"
         iconlink_file = "false"
@@ -143,8 +375,8 @@ def generate_custom_client(params, full_url):
         if not logofile:
             logofile = params.get('logobase64')
         logolink_url, logolink_uuid, logolink_file = save_png(logofile,myuuid,full_url,"logo.png")
-    except:
-        print("failed to get logo")
+    except (ValueError, OSError) as exc:
+        print(f"failed to get logo: {exc}")
         logolink_url = "false"
         logolink_uuid = "false"
         logolink_file = "false"
@@ -153,21 +385,21 @@ def generate_custom_client(params, full_url):
         if not privacyfile:
             privacyfile = params.get('privacybase64')
         privacylink_url, privacylink_uuid, privacylink_file = save_png(privacyfile,myuuid,full_url,"privacy.png")
-    except:
-        print("failed to get logo")
+    except (ValueError, OSError) as exc:
+        print(f"failed to get privacy image: {exc}")
         privacylink_url = "false"
         privacylink_uuid = "false"
         privacylink_file = "false"
 
     ###create the custom.txt json here and send in as inputs below
     decodedCustom = {}
-    if direction != "Both":
+    if direction != "both":
         decodedCustom['conn-type'] = direction
     if installation == "installationN":
         decodedCustom['disable-installation'] = 'Y'
     if settings == "settingsN":
         decodedCustom['disable-settings'] = 'Y'
-    if appname.upper != "rustdesk".upper and appname != "":
+    if appname_display.lower() != "rustdesk":
         decodedCustom['app-name'] = appname_display
     decodedCustom['override-settings'] = {}
     decodedCustom['default-settings'] = {}
@@ -187,7 +419,6 @@ def generate_custom_client(params, full_url):
     decodedCustom['enable-lan-discovery'] = 'N' if denyLan else 'Y'
     #decodedCustom['direct-server'] = 'Y' if enableDirectIP else 'N'
     decodedCustom['allow-auto-disconnect'] = 'Y' if autoClose else 'N'
-
     if permissionsDorO == "default":
         decodedCustom['default-settings']['access-mode'] = permissionsType
         decodedCustom['default-settings']['enable-keyboard'] = 'Y' if enableKeyboard else 'N'
@@ -207,8 +438,6 @@ def generate_custom_client(params, full_url):
         decodedCustom['default-settings']['enable-remote-printer'] = 'Y' if enablePrinter else 'N'
         decodedCustom['default-settings']['enable-camera'] = 'Y' if enableCamera else 'N'
         decodedCustom['default-settings']['enable-terminal'] = 'Y' if enableTerminal else 'N'
-        
-
     else:
         decodedCustom['override-settings']['access-mode'] = permissionsType
         decodedCustom['override-settings']['enable-keyboard'] = 'Y' if enableKeyboard else 'N'
@@ -228,9 +457,6 @@ def generate_custom_client(params, full_url):
         decodedCustom['override-settings']['enable-remote-printer'] = 'Y' if enablePrinter else 'N'
         decodedCustom['override-settings']['enable-camera'] = 'Y' if enableCamera else 'N'
         decodedCustom['override-settings']['enable-terminal'] = 'Y' if enableTerminal else 'N'
-        if direction == 'incoming':
-            decodedCustom['override-settings']['custom-rendezvous-server'] = server
-            decodedCustom['override-settings']['api-server'] = apiServer
 
     if defaultManual:
         for line in defaultManual.splitlines():
@@ -251,26 +477,10 @@ def generate_custom_client(params, full_url):
     encodedCustom = base64_bytes.decode("ascii")
 
     ####from here run the github action, we need user, repo, access token.
-    if platform == 'windows':
-        url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/generator-windows.yml/dispatches'
-        if selfhosted:
-            url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/sh-generator-windows.yml/dispatches'
-    if platform == 'windows-x86':
-        url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/generator-windows-x86.yml/dispatches'
-    elif platform == 'linux':
-        url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/generator-linux.yml/dispatches'
-    elif platform == 'android':
-        url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/generator-android.yml/dispatches'
-    elif platform == 'macos':
-        url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/generator-macos.yml/dispatches'
-    else:
-        url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/generator-windows.yml/dispatches'
-        if selfhosted:
-            url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/sh-generator-windows.yml/dispatches'
+    url = _workflow_dispatch_url(platform, selfhosted)
 
     inputs_raw = {
         "server":server,
-        "serverPort":serverPort,
         "key":key,
         "apiServer":apiServer,
         "custom":encodedCustom,
@@ -291,27 +501,29 @@ def generate_custom_client(params, full_url):
         "delayFix": 'true' if delayFix else 'false',
         "rdgen":'true',
         "xOffline": 'true' if xOffline else 'false',
+        "hidecm": 'true' if hidecm else 'false',
         "removeNewVersionNotif": 'true' if removeNewVersionNotif else 'false',
-        "update_public_key": update_public_key,
         "compname": compname,
         "androidappid":androidappid,
-        "filename":filename
+        "filename":filename,
+        "WEBDAV_URL":_settings.WEBDAV_URL,
+        "WEBDAV_USER":_settings.WEBDAV_USER,
+        "WEBDAV_PASS":_settings.WEBDAV_PASS,
+        "WEBDAV_DIR":_settings.WEBDAV_DIR,
+        "CALLBACK_TOKEN":_settings.CALLBACK_TOKEN,
     }
 
-    temp_json_path = f"data_{uuid.uuid4()}.json"
-    zip_filename = f"secrets_{uuid.uuid4()}.zip"
+    zip_filename = f"secrets_{myuuid}.zip"
     zip_path = "temp_zips/%s" % (zip_filename)
     Path("temp_zips").mkdir(parents=True, exist_ok=True)
 
-    with open(temp_json_path, "w") as f:
-        json.dump(inputs_raw, f)
-
     with pyzipper.AESZipFile(zip_path, 'w', compression=pyzipper.ZIP_LZMA, encryption=pyzipper.WZ_AES) as zf:
         zf.setpassword(_settings.ZIP_PASSWORD.encode())
-        zf.write(temp_json_path, arcname="secrets.json")
-
-    if os.path.exists(temp_json_path):
-        os.remove(temp_json_path)
+        zf.writestr('secrets.json', json.dumps(inputs_raw))
+        for asset_name in ('icon.png', 'logo.png', 'privacy.png'):
+            asset_path = Path('png') / myuuid / asset_name
+            if asset_path.is_file():
+                zf.write(asset_path, arcname=asset_name)
 
     zipJson = {}
     zipJson['url'] = full_url
@@ -319,31 +531,59 @@ def generate_custom_client(params, full_url):
 
     zip_url = json.dumps(zipJson)
 
+    # Prefer a private GitHub release asset. This avoids both the workflow input
+    # size limit and unreliable GitHub Runner -> rdgen server transfers.
+    bundle_asset_id = None
+    try:
+        bundle_asset_id = _upload_input_bundle(zip_path, zip_filename)
+    except requests.RequestException as exc:
+        print(f'Failed to upload encrypted input bundle to GitHub: {exc}')
+
+    # Small-payload fallback for tokens that cannot create release assets.
+    zip_b64 = ""
+    if not bundle_asset_id:
+        try:
+            with open(zip_path, "rb") as zf:
+                zip_b64 = base64.b64encode(zf.read()).decode('ascii')
+            if len(zip_b64) > 60000:
+                zip_b64 = ""
+        except Exception as e:
+            print(f"Failed to read zip for base64: {e}")
+
     data = {
         "ref":_settings.GHBRANCH,
         "inputs":{
             "version":version,
             "app_version":app_version,
-            "zip_url":zip_url
+            "zip_url":zip_url,
+            "zip_b64":zip_b64,
+            "bundle_asset_id":str(bundle_asset_id or ''),
         },
         "return_run_details": True
     } 
-    headers = {
-        'Accept':  'application/vnd.github+json',
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer '+_settings.GHBEARER,
-        'X-GitHub-Api-Version': '2026-03-10'
-    }
+    headers = _github_headers() | {'Content-Type': 'application/json'}
     new_github_run = GithubRun(
         uuid=myuuid,
         status="Starting generator...please wait"
     )
     try:
-        response = requests.post(url, json=data, headers=headers)
-        if response.status_code == 204 or response.status_code == 200:
-            github_data = response.json()
-            print(github_data)
-            new_github_run.github_run_id = github_data.get('workflow_run_id')
+        response = requests.post(
+            url,
+            json=data,
+            headers=headers,
+            timeout=(15, 45),
+        )
+        if response.status_code in (200, 204):
+            github_data = response.json() if response.content else {}
+            workflow_run_id = github_data.get('workflow_run_id')
+            if not workflow_run_id:
+                _delete_input_bundle(bundle_asset_id)
+                return {
+                    "success": False,
+                    "error": "GitHub accepted the request but did not return a workflow run ID",
+                    "status_code": 502,
+                }
+            new_github_run.github_run_id = workflow_run_id
             new_github_run.status = "in_progress"
             new_github_run.save()
 
@@ -355,12 +595,18 @@ def generate_custom_client(params, full_url):
                 "log_url": github_data.get('html_url')
             }
         else:
+            _delete_input_bundle(bundle_asset_id)
+            try:
+                github_message = response.json().get('message', response.text[:200])
+            except ValueError:
+                github_message = response.text[:200]
             return {
                 "success": False,
-                "error": "GitHub rejected the start request",
-                "status_code": 500
+                "error": f"GitHub rejected the start request ({response.status_code}: {github_message})",
+                "status_code": 502
             }
     except Exception as e:
+        _delete_input_bundle(bundle_asset_id)
         return {
             "success": False,
             "error": f"Connection error: {str(e)}",
@@ -394,7 +640,7 @@ def _get_run_status(uuid_val):
         api_url = f"https://api.github.com/repos/{_settings.GHUSER}/{_settings.REPONAME}/actions/runs/{gh_run.github_run_id}"
         
         try:
-            gh_response = requests.get(api_url, headers=headers)
+            gh_response = requests.get(api_url, headers=headers, timeout=30)
             if gh_response.status_code == 200:
                 gh_data = gh_response.json()
                 
@@ -417,7 +663,7 @@ def generator_view(request):
         form = GenerateForm(request.POST, request.FILES)
         if form.is_valid():
             params = form.cleaned_data
-            full_url = f"{_settings.PROTOCOL}://{request.get_host()}" if _settings.GENURL else f"{_settings.PROTOCOL}://{request.get_host()}"
+            full_url = _public_base_url(request)
             result = generate_custom_client(params, full_url)
             if result['success']:
                 return render(request, 'waiting.html', {
@@ -435,42 +681,6 @@ def generator_view(request):
     return render(request, 'generator.html', {'form': form})
 
 
-def _expected_files_for_platform(filename, platform):
-    """Return the list of expected output filenames for a given platform."""
-    if platform == 'windows':
-        return [f"{filename}.exe", f"{filename}.msi"]
-    elif platform == 'windows-x86':
-        return [f"{filename}.exe"]
-    elif platform == 'linux':
-        return [
-            f"{filename}-x86_64.deb",
-            f"{filename}-unattended-wayland-x86_64.deb",
-            f"{filename}-x86_64.rpm",
-            f"{filename}-suse-x86_64.rpm",
-            f"{filename}-x86_64.pkg.tar.zst",
-            f"{filename}-aarch64.deb",
-            f"{filename}-aarch64.rpm",
-            f"{filename}-suse-aarch64.rpm",
-            f"{filename}-aarch64.pkg.tar.zst",
-            f"{filename}-x86_64.AppImage",
-            f"{filename}-aarch64.AppImage",
-            f"{filename}-x86_64.flatpak",
-            f"{filename}-aarch64.flatpak",
-        ]
-    elif platform == 'android':
-        return [
-            f"{filename}-aarch64.apk",
-            f"{filename}-x86_64.apk",
-            f"{filename}-armv7.apk",
-        ]
-    elif platform == 'macos':
-        return [
-            f"{filename}-x86_64.dmg",
-            f"{filename}-aarch64.dmg",
-        ]
-    return []
-
-
 def check_for_file(request):
     filename = request.GET.get('filename')
     uuid = request.GET.get('uuid')
@@ -485,22 +695,21 @@ def check_for_file(request):
     github_log_url = result['github_log_url']
 
     if gh_run.status == "success":
-        expected = _expected_files_for_platform(filename, platform)
-        existing_files = []
-        missing_files = []
-        for f in expected:
-            file_path = os.path.join('exe', uuid, f)
-            if os.path.isfile(file_path):
-                existing_files.append(f)
-            else:
-                missing_files.append(f)
-
+        local_dir = Path(_settings.BASE_DIR) / 'exe' / gh_run.uuid
+        existing_files = {
+            path.name for path in local_dir.iterdir()
+            if local_dir.is_dir() and path.is_file()
+        } if local_dir.is_dir() else set()
+        try:
+            existing_files.update(_list_run_artifact_files(gh_run.github_run_id))
+        except requests.RequestException as exc:
+            print(f'Could not list artifacts for run {gh_run.github_run_id}: {exc}')
         return render(request, 'generated.html', {
             'filename': filename,
             'uuid': uuid,
             'platform': platform,
-            'existing_files': existing_files,
-            'missing_files': missing_files,
+            'existing_files': sorted(existing_files),
+            'missing_files': [],
             'github_log_url': github_log_url,
         })
         
@@ -523,32 +732,63 @@ def check_for_file(request):
         })
 
 def download(request):
-    filename = request.GET['filename']
-    uuid = request.GET['uuid']
-    if not _safe_parts(uuid, filename):
-        return HttpResponseForbidden("Invalid filename")
-    file_path = os.path.join('exe', uuid, filename)
-    with open(file_path, 'rb') as file:
-        content = file.read()
-    response = HttpResponse(content, headers={
-        'Content-Type': 'application/vnd.microsoft.portable-executable',
-        'Content-Disposition': f'attachment; filename="{filename}"'
-    })
-    return response
+    filename = request.GET.get('filename', '')
+    uuid_value = request.GET.get('uuid', '')
+    if not filename or Path(filename).name != filename or '\x00' in filename:
+        return HttpResponseBadRequest('Invalid filename')
+    try:
+        uuid.UUID(uuid_value)
+    except (ValueError, AttributeError):
+        return HttpResponseBadRequest('Invalid UUID')
+
+    try:
+        github_run = GithubRun.objects.get(uuid=uuid_value)
+    except GithubRun.DoesNotExist:
+        return HttpResponseNotFound('Build not found')
+
+    content_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+    local_path = Path(_settings.BASE_DIR) / 'exe' / uuid_value / filename
+    if local_path.is_file():
+        return FileResponse(
+            local_path.open('rb'),
+            as_attachment=True,
+            filename=filename,
+            content_type=content_type,
+        )
+
+    if not github_run.github_run_id:
+        return HttpResponseNotFound('Build artifact is not available')
+    try:
+        artifact_file = _download_artifact_file(github_run.github_run_id, filename)
+    except requests.RequestException as exc:
+        print(f'GitHub artifact download failed for run {github_run.github_run_id}: {exc}')
+        return HttpResponse('Build artifact is temporarily unavailable', status=502)
+    if artifact_file is None:
+        return HttpResponseNotFound('Requested file was not found in the build artifacts')
+    return FileResponse(
+        artifact_file,
+        as_attachment=True,
+        filename=filename,
+        content_type=content_type,
+    )
 
 def get_png(request):
-    filename = request.GET['filename']
-    uuid = request.GET['uuid']
-    if not _safe_parts(uuid, filename):
-        return HttpResponseForbidden("Invalid filename")
-    file_path = os.path.join('png',uuid,filename)
-    with open(file_path, 'rb') as file:
-        response = HttpResponse(file, headers={
-            'Content-Type': 'application/vnd.microsoft.portable-executable',
-            'Content-Disposition': f'attachment; filename="{filename}"'
-        })
-
-    return response
+    filename = request.GET.get('filename', '')
+    uuid_value = request.GET.get('uuid', '')
+    if filename not in {'icon.png', 'logo.png', 'privacy.png'}:
+        return HttpResponseBadRequest('Invalid asset filename')
+    try:
+        uuid_value = str(uuid.UUID(uuid_value))
+    except (ValueError, AttributeError):
+        return HttpResponseBadRequest('Invalid UUID')
+    file_path = Path(_settings.BASE_DIR) / 'png' / uuid_value / filename
+    if not file_path.is_file():
+        return HttpResponseNotFound('Asset not found')
+    return FileResponse(
+        file_path.open('rb'),
+        filename=filename,
+        content_type='image/png',
+    )
 
 def create_github_run(myuuid):
     new_github_run = GithubRun(
@@ -557,11 +797,26 @@ def create_github_run(myuuid):
     )
     new_github_run.save()
 
+@csrf_exempt
 def update_github_run(request):
-    data = json.loads(request.body)
-    myuuid = data.get('uuid')
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    if not _callback_is_authorized(request):
+        return HttpResponseForbidden('Invalid callback token')
+    try:
+        data = json.loads(request.body)
+        myuuid = str(uuid.UUID(str(data.get('uuid'))))
+    except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+        return HttpResponseBadRequest('Invalid request')
     mystatus = data.get('status')
-    GithubRun.objects.filter(Q(uuid=myuuid)).update(status=mystatus)
+    allowed_statuses = {
+        'queued', 'in_progress', 'success', 'failure', 'cancelled',
+        'timed_out', 'skipped', 'action_required',
+    }
+    if not isinstance(mystatus, str) or mystatus not in allowed_statuses:
+        return HttpResponseBadRequest('Invalid status')
+    if not GithubRun.objects.filter(Q(uuid=myuuid)).update(status=mystatus):
+        return HttpResponseNotFound('Run not found')
     return HttpResponse('')
 
 def resize_and_encode_icon(imagefile):
@@ -604,110 +859,321 @@ def resize_and_encode_icon(imagefile):
     return resized64
  
 #the following is used when accessed from an external source, like the rustdesk api server
+@csrf_exempt
 def startgh(request):
-    #print(request)
-    data_ = json.loads(request.body)
-    ####from here run the github action, we need user, repo, access token.
-    url = 'https://api.github.com/repos/'+_settings.GHUSER+'/'+_settings.REPONAME+'/actions/workflows/generator-'+data_.get('platform')+'.yml/dispatches'  
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    if not _callback_is_authorized(request):
+        return HttpResponseForbidden('Invalid callback token')
+    try:
+        data_ = json.loads(request.body)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return HttpResponseBadRequest('Invalid JSON')
+    if not isinstance(data_, dict):
+        return HttpResponseBadRequest('JSON body must be an object')
+    platform = data_.get('platform')
+    if not isinstance(platform, str) or platform not in WORKFLOW_BY_PLATFORM:
+        return HttpResponseBadRequest('Invalid platform')
+    if not _settings.ZIP_PASSWORD:
+        return HttpResponse('Encrypted build inputs are not configured', status=503)
+
+    try:
+        run_uuid = str(uuid.UUID(str(data_.get('uuid', ''))))
+    except (ValueError, AttributeError):
+        return HttpResponseBadRequest('Invalid UUID')
+
+    version = data_.get('version', '1.5.1')
+    if not isinstance(version, str) or version not in {'master', '1.5.0', '1.5.1'}:
+        return HttpResponseBadRequest('Invalid RustDesk version')
+
+    custom = data_.get('custom', '')
+    if isinstance(custom, dict):
+        custom = base64.b64encode(json.dumps(custom).encode('utf-8')).decode('ascii')
+    elif isinstance(custom, str):
+        try:
+            base64.b64decode(custom, validate=True)
+        except (ValueError, TypeError):
+            return HttpResponseBadRequest('Custom settings must be valid Base64')
+    else:
+        return HttpResponseBadRequest('Invalid custom settings')
+
+    filename = data_.get('filename', 'rustdesk')
+    appname = data_.get('appname', 'rustdesk')
+    if not isinstance(filename, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,120}', filename):
+        return HttpResponseBadRequest('Invalid filename')
+    root_values = {
+        'appname': appname,
+        'serverIP': data_.get('server', ''),
+        'serverPort': data_.get('serverPort', '21116'),
+        'key': data_.get('key', ''),
+        'apiServer': data_.get('apiServer', ''),
+        'compname': root_values['compname'],
+        'urlLink': root_values['urlLink'],
+        'downloadLink': root_values['downloadLink'],
+        'androidappid': root_values['androidappid'],
+        'app_version': root_values['app_version'],
+        'app_version': data_.get('app_version', ''),
+    }
+    for field, value in root_values.items():
+        error = build_parameter_error(field, value)
+        if error:
+            return HttpResponseBadRequest(f'Invalid {field}: {error}')
+
+    full_url = _public_base_url(request)
+    input_values = {
+        'server': data_.get('server', ''),
+        'serverPort': data_.get('serverPort', '21116'),
+        'key': data_.get('key', ''),
+        'apiServer': data_.get('apiServer', ''),
+        'custom': custom,
+        'uuid': run_uuid,
+        'appname': appname,
+        'filename': filename,
+        'compname': data_.get('compname', ''),
+        'urlLink': data_.get('urlLink', 'https://rustdesk.com'),
+        'downloadLink': data_.get('downloadLink', 'https://rustdesk.com/download'),
+        'androidappid': data_.get('androidappid', 'com.carriez.flutter_hbb'),
+        'genurl': _settings.GENURL,
+        'rdgen': 'true',
+        'CALLBACK_TOKEN': _settings.CALLBACK_TOKEN,
+        'delayFix': 'true',
+        'xOffline': 'false',
+        'hidecm': 'false',
+        'removeNewVersionNotif': 'false',
+        'WEBDAV_URL': _settings.WEBDAV_URL,
+        'WEBDAV_USER': _settings.WEBDAV_USER,
+        'WEBDAV_PASS': _settings.WEBDAV_PASS,
+        'WEBDAV_DIR': _settings.WEBDAV_DIR,
+    }
+
+    extras = data_.get('extras', {})
+    if isinstance(extras, str):
+        try:
+            extras = json.loads(extras) if extras else {}
+        except json.JSONDecodeError:
+            return HttpResponseBadRequest('Extras must be a JSON object')
+    if extras:
+        if not isinstance(extras, dict):
+            return HttpResponseBadRequest('Extras must be a JSON object')
+        allowed_extras = {
+            'serverPort', 'compname', 'urlLink', 'downloadLink', 'androidappid',
+            'app_version', 'delayFix', 'xOffline', 'hidecm',
+            'removeNewVersionNotif', 'direction', 'installation', 'settings',
+            'theme', 'themeDorO', 'passApproveMode', 'permissionsDorO',
+            'permissionsType', 'permanentPassword', 'defaultManual', 'overrideManual',
+        }
+        for field in allowed_extras:
+            if field in extras:
+                error = build_parameter_error(field, extras[field])
+                if error:
+                    return HttpResponseBadRequest(f'Invalid {field}: {error}')
+                input_values[field] = extras[field]
+
+    def legacy_asset(value, default_name):
+        if isinstance(value, dict):
+            asset_url = value.get('url', '')
+            asset_uuid = value.get('uuid', '')
+            asset_file = value.get('file', default_name)
+        elif isinstance(value, str) and value:
+            parsed = urlsplit(value)
+            query = parse_qs(parsed.query)
+            asset_uuid = query.get('uuid', [''])[0]
+            asset_file = query.get('filename', [default_name])[0]
+            asset_url = urlunsplit((parsed.scheme, parsed.netloc, '', '', '')) if parsed.scheme and parsed.netloc else value.rstrip('/')
+        else:
+            return 'false', 'false', 'false'
+        try:
+            asset_uuid = str(uuid.UUID(str(asset_uuid)))
+        except (ValueError, AttributeError):
+            return 'false', 'false', 'false'
+        if asset_file != default_name or not isinstance(asset_url, str) or not asset_url:
+            return 'false', 'false', 'false'
+        parsed_url = urlsplit(asset_url)
+        if (parsed_url.scheme not in {'http', 'https'} or not parsed_url.hostname
+                or parsed_url.username or parsed_url.password
+                or parsed_url.query or parsed_url.fragment
+                or build_parameter_error('urlLink', asset_url)):
+            return 'false', 'false', 'false'
+        return asset_url, asset_uuid, default_name
+
+    for kind, field, asset_name in (
+        ('icon', 'iconlink', 'icon.png'),
+        ('logo', 'logolink', 'logo.png'),
+    ):
+        asset_url, asset_uuid, asset_file = legacy_asset(data_.get(field), asset_name)
+        input_values[f'{kind}link_url'] = asset_url
+        input_values[f'{kind}link_uuid'] = asset_uuid
+        input_values[f'{kind}link_file'] = asset_file
+    for suffix in ('url', 'uuid', 'file'):
+        input_values[f'privacylink_{suffix}'] = 'false'
+
+    zip_filename = f'secrets_{run_uuid}.zip'
+    zip_dir = Path(_settings.BASE_DIR) / 'temp_zips'
+    zip_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = zip_dir / zip_filename
+    try:
+        with pyzipper.AESZipFile(
+            zip_path, 'w', compression=pyzipper.ZIP_LZMA,
+            encryption=pyzipper.WZ_AES,
+        ) as bundle:
+            bundle.setpassword(_settings.ZIP_PASSWORD.encode())
+            bundle.writestr('secrets.json', json.dumps(input_values))
+    except (OSError, ValueError) as exc:
+        print(f'Could not create encrypted legacy input bundle: {exc}')
+        return HttpResponse('Could not prepare build inputs', status=500)
+
+    zip_url = json.dumps({'url': full_url, 'file': zip_filename})
+    bundle_asset_id = None
+    try:
+        bundle_asset_id = _upload_input_bundle(zip_path, zip_filename)
+    except requests.RequestException as exc:
+        print(f'Could not upload encrypted legacy input bundle: {exc}')
+
+    zip_b64 = ''
+    if not bundle_asset_id:
+        try:
+            encoded = base64.b64encode(zip_path.read_bytes()).decode('ascii')
+            if len(encoded) <= 60000:
+                zip_b64 = encoded
+        except OSError as exc:
+            print(f'Could not encode encrypted legacy input bundle: {exc}')
+
+    url = _workflow_dispatch_url(platform)
     data = {
         "ref": _settings.GHBRANCH,
         "inputs":{
-            "server":data_.get('server'),
-            "key":data_.get('key'),
-            "apiServer":data_.get('apiServer'),
-            "custom":data_.get('custom'),
-            "uuid":data_.get('uuid'),
-            "iconlink":data_.get('iconlink'),
-            "logolink":data_.get('logolink'),
-            "appname":data_.get('appname'),
-            "extras":data_.get('extras'),
-            "filename":data_.get('filename')
+            'version': version,
+            'app_version': input_values.get('app_version', ''),
+            'zip_url': zip_url,
+            'zip_b64': zip_b64,
+            'bundle_asset_id': str(bundle_asset_id or ''),
         }
-    } 
-    headers = {
-        'Accept':  'application/vnd.github+json',
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer '+_settings.GHBEARER,
-        'X-GitHub-Api-Version': '2026-03-10'
     }
-    response = requests.post(url, json=data, headers=headers)
-    print(response)
-    return HttpResponse(status=204)
+    headers = _github_headers() | {'Content-Type': 'application/json'}
+    try:
+        response = requests.post(url, json=data, headers=headers, timeout=(15, 45))
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        _delete_input_bundle(bundle_asset_id)
+        print(f'Legacy workflow dispatch failed: {exc}')
+        return HttpResponse('GitHub dispatch failed', status=502)
+    try:
+        github_data = response.json() if response.content else {}
+    except ValueError:
+        github_data = {}
+    run_id = github_data.get('workflow_run_id')
+    if not run_id:
+        _delete_input_bundle(bundle_asset_id)
+        return HttpResponse('GitHub did not return a workflow run ID', status=502)
+    GithubRun.objects.update_or_create(
+        uuid=run_uuid,
+        defaults={'status': 'in_progress', 'github_run_id': run_id},
+    )
+    return JsonResponse({'success': True, 'uuid': run_uuid, 'run_id': run_id}, status=202)
 
-def save_png(file, uuid, domain, name):
-    file_save_path = "png/%s/%s" % (uuid, name)
-    Path("png/%s" % uuid).mkdir(parents=True, exist_ok=True)
+def save_png(file, uuid_value, domain, name):
+    """Validate and normalize uploaded branding assets to real PNG files."""
+    if not file or name not in {'icon.png', 'logo.png', 'privacy.png'}:
+        raise ValueError('Missing or invalid image asset')
+    uuid_value = str(uuid.UUID(str(uuid_value)))
 
-    if isinstance(file, str):  # Check if it's a base64 string
+    if isinstance(file, str):
+        if len(file) > (_settings.MAX_IMAGE_UPLOAD_BYTES * 4 // 3) + 1024:
+            raise ValueError('Image asset is too large')
         try:
-            header, encoded = file.split(';base64,')
-            decoded_img = base64.b64decode(encoded)
-            file = ContentFile(decoded_img, name=name) # Create a file-like object
-        except ValueError:
-            print("Invalid base64 data")
-            return None  # Or handle the error as you see fit
-        except Exception as e:  # Catch general exceptions during decoding
-            print(f"Error decoding base64: {e}")
-            return None
-        
-    with open(file_save_path, "wb+") as f:
-        for chunk in file.chunks():
-            f.write(chunk)
-    # imageJson = {}
-    # imageJson['url'] = domain
-    # imageJson['uuid'] = uuid
-    # imageJson['file'] = name
-    #return "%s/%s" % (domain, file_save_path)
-    return domain, uuid, name
+            _, encoded = file.split(';base64,', 1)
+            image_bytes = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise ValueError('Invalid base64 image data') from exc
+    else:
+        if file.size > _settings.MAX_IMAGE_UPLOAD_BYTES:
+            raise ValueError('Image asset is too large')
+        image_bytes = b''.join(file.chunks())
+    if len(image_bytes) > _settings.MAX_IMAGE_UPLOAD_BYTES:
+        raise ValueError('Image asset is too large')
 
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            if source.width * source.height > _settings.MAX_IMAGE_PIXELS:
+                raise ValueError('Image dimensions exceed the pixel limit')
+            source.load()
+            normalized = source.convert('RGBA')
+            output = io.BytesIO()
+            normalized.save(output, format='PNG', optimize=True)
+    except (IOError, OSError, Image.DecompressionBombError) as exc:
+        raise ValueError('Uploaded file is not a valid image') from exc
+
+    output_dir = Path(_settings.BASE_DIR) / 'png' / uuid_value
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / name).write_bytes(output.getvalue())
+    return domain, uuid_value, name
+
+@csrf_exempt
 def save_custom_client(request):
-    file = request.FILES['file']
-    myuuid = request.POST.get('uuid')
-    if not _safe_parts(myuuid, file.name):
-        return HttpResponseForbidden("Invalid filename")
-    file_save_path = "exe/%s/%s" % (myuuid, file.name)
-    Path("exe/%s" % myuuid).mkdir(parents=True, exist_ok=True)
-    with open(file_save_path, "wb+") as f:
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    if not _callback_is_authorized(request):
+        return HttpResponseForbidden('Invalid callback token')
+    file = request.FILES.get('file')
+    if file is None or Path(file.name).name != file.name:
+        return HttpResponseBadRequest('Invalid file')
+    if file.size > _settings.MAX_BUILD_UPLOAD_BYTES:
+        return HttpResponse('File too large', status=413)
+    try:
+        myuuid = str(uuid.UUID(request.POST.get('uuid', '')))
+    except (ValueError, AttributeError):
+        return HttpResponseBadRequest('Invalid UUID')
+    output_dir = Path(_settings.BASE_DIR) / 'exe' / myuuid
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / file.name).open('wb') as f:
         for chunk in file.chunks():
             f.write(chunk)
 
     return HttpResponse("File saved successfully!")
 
+@csrf_exempt
 def cleanup_secrets(request):
+    if request.method != 'POST':
+        return HttpResponse(status=405)
+    if not _callback_is_authorized(request):
+        return HttpResponseForbidden('Invalid callback token')
     # Pass the UUID as a query param or in JSON body
-    data = json.loads(request.body)
+    try:
+        data = json.loads(request.body)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return HttpResponseBadRequest('Invalid JSON')
+    if not isinstance(data, dict):
+        return HttpResponseBadRequest('JSON body must be an object')
     my_uuid = data.get('uuid')
     
-    if not my_uuid:
-        return HttpResponse("Missing UUID", status=400)
+    try:
+        my_uuid = str(uuid.UUID(str(my_uuid)))
+    except (ValueError, AttributeError):
+        return HttpResponseBadRequest('Invalid UUID')
 
-    # 1. Find the files in your temp directory matching the UUID
-    temp_dir = os.path.join('temp_zips')
-    
-    # We look for any file starting with 'secrets_' and containing the uuid
-    for filename in os.listdir(temp_dir):
-        if my_uuid in filename and filename.endswith('.zip'):
-            file_path = os.path.join(temp_dir, filename)
-            try:
-                os.remove(file_path)
-                print(f"Successfully deleted {file_path}")
-            except OSError as e:
-                print(f"Error deleting file: {e}")
+    file_path = Path(_settings.BASE_DIR) / 'temp_zips' / f'secrets_{my_uuid}.zip'
+    try:
+        file_path.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f'Error deleting {file_path}: {exc}')
 
     return HttpResponse("Cleanup successful", status=200)
 
 def get_zip(request):
-    filename = request.GET['filename']
-    base_dir = os.path.abspath('temp_zips')
-    file_path = os.path.abspath(os.path.join(base_dir, filename))
-    if not file_path.startswith(base_dir + os.sep):
+    filename = request.GET.get('filename', '')
+    match = re.fullmatch(r'secrets_([0-9a-fA-F-]{36})\.zip', filename)
+    if not match or Path(filename).name != filename:
         return HttpResponseForbidden("Invalid filename")
-    with open(file_path, 'rb') as file:
-        response = HttpResponse(file, headers={
-            'Content-Type': 'application/vnd.microsoft.portable-executable',
-            'Content-Disposition': f'attachment; filename="{filename}"'
-        })
-
-    return response
-
-
+    try:
+        uuid.UUID(match.group(1))
+    except ValueError:
+        return HttpResponseForbidden("Invalid filename")
+    file_path = Path(_settings.BASE_DIR) / 'temp_zips' / filename
+    if not file_path.is_file():
+        return HttpResponseNotFound('Bundle not found')
+    return FileResponse(
+        file_path.open('rb'),
+        as_attachment=True,
+        filename=filename,
+        content_type='application/zip',
+    )

@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh RustDesk distribution TLS certificate daily
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+
+[Install]
+WantedBy=timers.target

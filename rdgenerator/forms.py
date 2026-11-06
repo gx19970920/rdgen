@@ -2,6 +2,7 @@ import re
 
 from django import forms
 from PIL import Image
+from .build_validation import build_parameter_error
 
 # App/company names are interpolated into single/double-quoted bash sed
 # scripts in every generator workflow: & \ | corrupt the substitution
@@ -9,12 +10,21 @@ from PIL import Image
 UNSAFE_NAME_CHARS = re.compile(r'[&\\|\'"$`\r\n]')
 
 class GenerateForm(forms.Form):
-    sh_secret_field = forms.CharField(required=False)
+    sh_secret_field = forms.CharField(
+        required=False,
+        widget=forms.PasswordInput(render_value=False),
+    )
     #Platform
     platform = forms.ChoiceField(choices=[('windows','Windows 64Bit'),('windows-x86','Windows 32Bit'),('linux','Linux'),('android','Android'),('macos','macOS')], initial='windows')
     version = forms.ChoiceField(choices=[('master','nightly'),('1.5.1','1.5.1'),('1.5.0','1.5.0')], initial='1.5.1')
     help_text="'master' is the development version (nightly build) with the latest features but may be less stable"
     delayFix = forms.BooleanField(initial=True, required=False)
+
+    app_version = forms.RegexField(
+        regex=r'^[0-9]+\.[0-9]+\.[0-9]+(?:[.+-][0-9A-Za-z.-]+)?$',
+        max_length=64, required=False,
+        label='Custom app version',
+    )
 
     #General
     exename = forms.CharField(label="Name for EXE file", required=True)
@@ -132,3 +142,11 @@ class GenerateForm(forms.Form):
 
     def clean_compname(self):
         return self._reject_unsafe_name_chars('compname')
+
+    def clean(self):
+        cleaned = super().clean()
+        for name, value in list(cleaned.items()):
+            error = build_parameter_error(name, value)
+            if error:
+                self.add_error(name, error)
+        return cleaned

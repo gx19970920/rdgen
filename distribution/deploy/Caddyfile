@@ -1,0 +1,9 @@
+{
+    admin 127.0.0.1:12019
+    auto_https disable_redirects
+}
+
+:{$DIST_TLS_PORT} {
+    tls /managed/fullchain.pem /certs/{$DIST_KEY_NAME}
+    reverse_proxy 127.0.0.1:18991
+}

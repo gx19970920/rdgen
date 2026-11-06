@@ -15,34 +15,63 @@ runs:
     - name: install python deps
       shell: bash
       run: |
-        pip install pyzipper
+        pip install pyzipper==0.4.0
     - name: Decrypt and Mask
       shell: python
       env:
-        PYTHONUTF8: "1"
-        PYTHONIOENCODING: "utf-8"
+        INPUT_ZIP_PASSWORD: ${{ inputs.zip_password }}
+        INPUT_ZIP_PATH: ${{ inputs.zip_path }}
       run: |
-        import sys
-        import io
         import pyzipper
         import json
         import os
+        import re
+        import secrets
+        import shutil
+        import sys
+        from pathlib import Path
 
-        # Force UTF-8 stdout/stderr so secrets with characters outside
-        # the runner codepage (CJK, emoji, etc.) do not crash this step
-        # on Windows runners (default cp1251) with UnicodeEncodeError
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+        # Windows runners may use a legacy code page, so emit workflow commands as UTF-8.
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, 'reconfigure'):
+                stream.reconfigure(encoding='utf-8')
 
-        with pyzipper.AESZipFile('${{ inputs.zip_path }}') as zf:
-            zf.setpassword('${{ inputs.zip_password }}'.encode())
+        asset_dir = Path(os.environ['RUNNER_TEMP']) / 'rdgen-assets'
+        asset_dir.mkdir(parents=True, exist_ok=True)
+
+        with pyzipper.AESZipFile(os.environ['INPUT_ZIP_PATH']) as zf:
+            zf.setpassword(os.environ['INPUT_ZIP_PASSWORD'].encode())
             with zf.open('secrets.json') as f:
-                secrets = json.load(f)
+                secret_values = json.load(f)
+            for asset_name in ('icon.png', 'logo.png', 'privacy.png'):
+                if asset_name in zf.namelist():
+                    with zf.open(asset_name) as source, (asset_dir / asset_name).open('wb') as target:
+                        shutil.copyfileobj(source, target)
+
+        action_path = Path(os.environ['GITHUB_ACTION_PATH'])
+        webdav_script = action_path.parent.parent / 'scripts' / 'upload_webdav.py'
+        shutil.copy2(webdav_script, asset_dir / webdav_script.name)
+        for source in (action_path.parent.parent / 'patches').iterdir():
+            if source.is_file():
+                shutil.copy2(source, asset_dir / source.name)
+
+        def escape_workflow_command(value):
+            return value.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+
+        def write_multiline_env(env_file, key, value):
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key):
+                raise ValueError(f'Invalid environment variable name: {key!r}')
+            delimiter = f'RDGEN_{secrets.token_hex(16)}'
+            while delimiter in value:
+                delimiter = f'RDGEN_{secrets.token_hex(16)}'
+            env_file.write(f'{key}<<{delimiter}\n{value}\n{delimiter}\n')
 
         with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env_file:
-            for key, value in secrets.items():
-                if value:
-                    print(f"::add-mask::{value}")
-                    env_file.write(f"{key}={value}\n")
+            env_file.write(f"RDGEN_ASSET_DIR={asset_dir}\n")
+            for key, value in secret_values.items():
+                if value is not None and value != '':
+                    value = str(value)
+                    print(f"::add-mask::{escape_workflow_command(value)}")
+                    write_multiline_env(env_file, key, value)
         
-        print(f"Successfully masked {len(secrets)} secrets.")
+        print(f"Successfully masked {len(secret_values)} secrets.")

@@ -1,5 +1,8 @@
 name: Custom Linux Client Generator
 run-name: Custom Linux Client Generator
+permissions:
+  actions: write
+  contents: write
 on: 
   workflow_dispatch:
     inputs:
@@ -13,6 +16,21 @@ on:
         required: true
         default: ''
         type: string
+      zip_b64:
+        description: 'base64 encoded encrypted input bundle'
+        required: false
+        default: ''
+        type: string
+      bundle_asset_id:
+        description: 'private GitHub release asset ID for encrypted inputs'
+        required: false
+        default: ''
+        type: string
+      verify_only:
+        description: 'Build a synthetic client without callbacks, NAS upload or notifications'
+        type: boolean
+        required: false
+        default: false
       app_version:
         description: 'custom app version string (overrides build version)'
         required: false
@@ -31,7 +49,6 @@ env:
   FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
   # for arm64 linux because official Dart SDK does not work
   FLUTTER_ELINUX_VERSION: "3.16.9"
-  TAG_NAME: "${{ inputs.upload-tag }}"
   VCPKG_BINARY_SOURCES: "clear"
   # vcpkg version: 2024.07.12
   VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
@@ -44,6 +61,10 @@ env:
   MACOS_P12_BASE64: "${{ secrets.MACOS_P12_BASE64 }}"
   UPLOAD_ARTIFACT: 'true'
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}"
+  WEBDAV_URL: "${{ secrets.WEBDAV_URL }}"
+  WEBDAV_USER: "${{ secrets.WEBDAV_USER }}"
+  WEBDAV_PASS: "${{ secrets.WEBDAV_PASS }}"
+  WEBDAV_DIR: "${{ secrets.WEBDAV_DIR }}"
   STATUS_URL: "${{ secrets.GENURL }}/updategh"
 
 jobs:
@@ -51,6 +72,11 @@ jobs:
     uses: ./.github/workflows/fetch-encrypted-secrets.yml
     with:
       zip_url_json: ${{ inputs.zip_url }}
+      zip_b64: ${{ inputs.zip_b64 }}
+      bundle_asset_id: ${{ inputs.bundle_asset_id }}
+      verify_only: ${{ inputs.verify_only }}
+    secrets:
+      ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
 
   generate-bridge-linux:
     uses: ./.github/workflows/bridge.yml
@@ -96,7 +122,7 @@ jobs:
           zip_password: ${{ secrets.ZIP_PASSWORD }}
 
       - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
@@ -157,7 +183,7 @@ jobs:
         if: ${{ env.update_public_key != '' }}
         shell: bash
         run: |
-          curl -sSL -o allow_custom_update.py https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/allow_custom_update.py
+          python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'allow_custom_update.py'), 'allow_custom_update.py')"
           python3 allow_custom_update.py \
             --rustdesk-root . \
             --update-url "${{ env.downloadLink}}/api/version/latest" \
@@ -194,7 +220,7 @@ jobs:
 
       - name: Restore bridge files
         if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
-        uses: actions/download-artifact@master
+        uses: actions/download-artifact@v4
         with:
           name: bridge-artifact
           path: ./
@@ -297,7 +323,6 @@ jobs:
           sed -i -e 's|OriginalFilename = "rustdesk.exe"|OriginalFilename = "${{ env.appname }}.exe"|' ./libs/portable/Cargo.toml
           sed -i -e 's|const APP_PREFIX: \&str = "rustdesk";|const APP_PREFIX: \&str = "${{ env.appname }}";|' ./libs/portable/src/main.rs
           find ./src/lang -name "*.rs" -exec sed -i -e 's|RustDesk|${{ env.appname }}|' {} \;
-          sed -i -e '/-p tmpdeb\/usr\/lib\/rustdesk/d' ./build.py
 
       - name: change company name
         if: env.compname != 'Purslane Ltd'
@@ -316,11 +341,10 @@ jobs:
           sed -i -e 's|Purslane Ltd|${{ env.compname }}|' ./src/main.rs
           
       - name: set server, serverPort, key, and apiserver
-        continue-on-error: true
         shell: bash
         env:
           SERVER_DOMAIN: ${{ env.server }}
-          SERVER_PORT_INPUT: ${{ env.serverPort }}
+          SERVER_PORT_INPUT: ${{ env.serverPort || '21116' }}
           SERVER_KEY: ${{ env.key }}
           API_SERVER: ${{ env.apiServer }}
         run: |
@@ -372,9 +396,9 @@ jobs:
           retry_wait_seconds: 15
           shell: bash
           command: |
-            wget https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/allowCustom.py
+            python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'allowCustom.py'), 'allowCustom.py')"
             python allowCustom.py
-            wget https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/removeSetupServerTip.diff
+            python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'removeSetupServerTip.diff'), 'removeSetupServerTip.diff')"
             git apply removeSetupServerTip.diff
             echo -n '${{ env.custom }}' > ./custom_.txt
           
@@ -420,7 +444,7 @@ jobs:
           retry_wait_seconds: 15
           shell: bash
           command: |
-            wget https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/xoffline.diff
+            python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'xoffline.diff'), 'xoffline.diff')"
             git apply xoffline.diff
 
       - name: hide-cm
@@ -432,19 +456,18 @@ jobs:
           retry_wait_seconds: 15
           shell: bash
           command: |
-            wget https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/hidecm.diff
+            python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'hidecm.diff'), 'hidecm.diff')"
             git apply hidecm.diff
         
       - name: removeNewVersionNotif
-        continue-on-error: true
         if: env.removeNewVersionNotif == 'true'
         run: | 
           sed -i -e 's|updateUrl.isNotEmpty|false|' ./flutter/lib/desktop/pages/desktop_home_page.dart
-          #sed -i '/let (request, url) =/,/Ok(())/{/Ok(())/!d}' ./src/common.rs
+          python -c "import os, runpy; runpy.run_path(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'disable_update_check.py'), run_name='__main__')"
 
       - name: Restore bridge files
         if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
-        uses: actions/download-artifact@master
+        uses: actions/download-artifact@v4
         with:
           name: bridge-artifact
           path: ./
@@ -534,9 +557,9 @@ jobs:
             echo $JOBS
 
             # Make the right unit stop when the services is stopped by tray
-            sed -ie "s|\(systemctl\s\+\S\+\s\){app_name}|\1${{ env.appname }}|g" src/platform/linux.rs
-            sed -ie 's|\({home}/{p}/{app_name0}2\?.toml\)|\\"\1\\"|g' src/platform/linux.rs
-            sed -ie 's|\(/root/{p}/\)|\\"\1\\"|g' src/platform/linux.rs
+            sed -i -e "s|\(systemctl\s\+\S\+\s\){app_name}|\1${{ env.appname }}|g" src/platform/linux.rs
+            sed -i -e 's|\({home}/{p}/{app_name0}2\?.toml\)|\\"\1\\"|g' src/platform/linux.rs
+            sed -i -e 's|\(/root/{p}/\)|\\"\1\\"|g' src/platform/linux.rs
 
             cargo build --lib $JOBS --features hwcodec,flutter,unix-file-copy-paste --release
             rm -rf target/release/deps target/release/build
@@ -619,9 +642,9 @@ jobs:
             # Only run the whitelabeling steps if the custom app name is actually different
             if [ "${{ env.appname }}" != "rustdesk" ]; then
                 # Change files names in the output .deb
-                sed -ie "s|\(cp .* \)tmpdeb/usr/share/rustdesk/files/systemd/|\1tmpdeb/usr/share/rustdesk/files/systemd/${{ env.appname }}.service|g" build.py
-                sed -ie "s|cp -r \(.\+\)\* \([^ ]\+\)/rustdesk|mv \1rustdesk \1${{ env.appname }}; cp -r \1\* \2/${{ env.appname }}|g" build.py
-                sed -ie "s|\(tmpdeb/[^ ]*\)rustdesk|\1${{ env.appname }}|g" build.py
+                sed -i -e "s|\(cp .* \)tmpdeb/usr/share/rustdesk/files/systemd/|\1tmpdeb/usr/share/rustdesk/files/systemd/${{ env.appname }}.service|g" build.py
+                sed -i -e "s|cp -r \(.\+\)\* \([^ ]\+\)/rustdesk|mv \1rustdesk \1${{ env.appname }}; cp -r \1\* \2/${{ env.appname }}|g" build.py
+                sed -i -e "s|\(tmpdeb/[^ ]*\)rustdesk|\1${{ env.appname }}|g" build.py
                 # The rename above is greedy in \1, so it rewrites only the LAST
                 # "rustdesk" of each path and leaves build.py's globs pointing where the
                 # staging tree never exists. Three corrections, all confined to the drm
@@ -630,36 +653,36 @@ jobs:
                 #
                 # 1. Directory component: the cp -r rename above stages into
                 #    tmpdeb/usr/share/<appname>/, but the globs kept usr/share/rustdesk/.
-                sed -ie "s|tmpdeb/usr/share/rustdesk/|tmpdeb/usr/share/${{ env.appname }}/|g" build.py
+                sed -i -e "s|tmpdeb/usr/share/rustdesk/|tmpdeb/usr/share/${{ env.appname }}/|g" build.py
                 # 2. Library filename: build.py renames only the executable and copies the
                 #    bundle verbatim, so the cdylib stays librustdesk.so. The greedy sed
                 #    renamed it to lib<appname>.so, and that is the file carrying the drm
                 #    marker -- the thin Flutter launcher does not.
-                sed -ie "s|lib/lib${{ env.appname }}\.so|lib/librustdesk.so|g" build.py
+                sed -i -e "s|lib/lib${{ env.appname }}\.so|lib/librustdesk.so|g" build.py
                 # 3. libdrmtap must NOT be renamed: drmtap_dl.rs dlopens the absolute path
                 #    /usr/lib/rustdesk/libdrmtap.so.0, compiled into the binary and
                 #    rewritten by nothing here. Staging it under /usr/lib/<appname>/
                 #    packages and installs cleanly, then never loads on the user's machine.
-                sed -ie "s|tmpdeb/usr/lib/${{ env.appname }}|tmpdeb/usr/lib/rustdesk|g" build.py
-                sed -ie "s|Package: rustdesk|Package: ${{ env.appname }}|g" build.py
-                sed -ie "s|RustDesk|${{ env.appname }}|g" res/rustdesk.desktop
+                sed -i -e "s|tmpdeb/usr/lib/${{ env.appname }}|tmpdeb/usr/lib/rustdesk|g" build.py
+                sed -i -e "s|Package: rustdesk|Package: ${{ env.appname }}|g" build.py
+                sed -i -e "s|RustDesk|${{ env.appname }}|g" res/rustdesk.desktop
                 FILES=$(sed -ne "s~.*cp\s\(../\)\?\+\(.\+\.\(desktop\|service\)\)\s\+tmpdeb/.*~\2~p" build.py | sort | uniq)
-                FILES=$(echo -e "$FILES\n$(ls --color=never res/DEBIAN/*)")
-                for FILE in $(echo $FILES | sed "s/\n/ /g"); do
-                  sed -ie "s|rustdesk|${{ env.appname }}|g" $FILE
-                done
+                FILES=$(printf '%s\n' "$FILES" res/DEBIAN/* | tr -d '\r')
+                while IFS= read -r FILE; do
+                  [ -n "$FILE" ] || continue
+                  sed -i -e "s|rustdesk|${{ env.appname }}|g" "$FILE"
+                done <<< "$FILES"
                 for file in "./res/rpm-flutter.spec" "./res/rpm-flutter-suse.spec"; do
-                  sed -ie "s|^\(URL:\s*\).*|\1${{ env.downloadLink }}|g" "$file"
-                  sed -ie "s|^\(Vendor:\s*\).*|\1${{ env.compname }}|g" "$file"
-                  sed -ie '/\${\?HBB}\?/!{/\(^Name:\|\/usr\|\/etc\|systemctl\)/s|rustdesk|${{ env.appname }}|g}' "$file"
-                  sed -ie '/\${\?HBB}\?/{/^install/s|\(\/usr\/.*\/\)rustdesk|\1${{ env.appname }}|g}' "$file"
-                  sed -ie '/\${\?HBB}\?/{/^mkdir/s|rustdesk|${{ env.appname }}|g}' "$file"
+                  sed -i -e "s|^\(URL:\s*\).*|\1${{ env.downloadLink }}|g" "$file"
+                  sed -i -e "s|^\(Vendor:\s*\).*|\1${{ env.compname }}|g" "$file"
+                  sed -i -e '/\${\?HBB}\?/!{/\(^Name:\|\/usr\|\/etc\|systemctl\)/s|rustdesk|${{ env.appname }}|g}' "$file"
+                  sed -i -e '/\${\?HBB}\?/{/^install/s|\(\/usr\/.*\/\)rustdesk|\1${{ env.appname }}|g}' "$file"
+                  sed -i -e '/\${\?HBB}\?/{/^mkdir/s|rustdesk|${{ env.appname }}|g}' "$file"
                   for extension in ".desktop" "-link.desktop" ".service"; do
-                    sed -ie "/^%files$/i\mv %{buildroot}/usr/share/${{ env.appname }}/files/rustdesk$extension %{buildroot}/usr/share/${{ env.appname }}/files/${{ env.appname }}$extension" "$file"
-                    sed -ie "/^%files$/i\sed -ie 's|RustDesk|${{ env.appname }}|g' %{buildroot}/usr/share/${{ env.appname }}/files/${{ env.appname }}$extension" "$file"
-                    sed -ie "/^%files$/i\sed -ie 's|rustdesk|${{ env.appname }}|g' %{buildroot}/usr/share/${{ env.appname }}/files/${{ env.appname }}$extension" "$file"
+                    sed -i -e "/^%files$/i\mv %{buildroot}/usr/share/${{ env.appname }}/files/rustdesk$extension %{buildroot}/usr/share/${{ env.appname }}/files/${{ env.appname }}$extension" "$file"
+                    sed -i -e "/^%files$/i\sed -i -e 's|RustDesk|${{ env.appname }}|g' %{buildroot}/usr/share/${{ env.appname }}/files/${{ env.appname }}$extension" "$file"
+                    sed -i -e "/^%files$/i\sed -i -e 's|rustdesk|${{ env.appname }}|g' %{buildroot}/usr/share/${{ env.appname }}/files/${{ env.appname }}$extension" "$file"
                   done
-                  sed -ie '/^%files$/i\\n' "$file"
                 done
             fi
 
@@ -731,6 +754,15 @@ jobs:
         run: |
           cp ./res/rustdesk-${{ env.VERSION }}-0-x86_64.pkg.tar.zst ./output/${{ env.filename }}-${{ matrix.job.arch }}.pkg.tar.zst
 
+      - name: Preserve verification packages
+        if: inputs.verify_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-linux-${{ matrix.job.arch }}
+          path: ./output/*
+          if-no-files-found: error
+          retention-days: 7
+
       - name: send file to rdgen server
         if: ${{ env.rdgen == 'true' }}
         uses: nick-fields/retry@v3
@@ -740,10 +772,21 @@ jobs:
           retry_wait_seconds: 15
           shell: bash
           command: |
-            curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./output/${{ env.filename }}-${{ matrix.job.arch }}.deb" -F "uuid=${{ env.uuid }}" ${{ secrets.GENURL }}/save_custom_client
-            curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./output/${{ env.filename }}-${{ matrix.job.arch }}.rpm" -F "uuid=${{ env.uuid }}" ${{ secrets.GENURL }}/save_custom_client
-            curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./output/${{ env.filename }}-suse-${{ matrix.job.arch }}.rpm" -F "uuid=${{ env.uuid }}" ${{ secrets.GENURL }}/save_custom_client
-            curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./output/${{ env.filename }}-${{ matrix.job.arch }}.pkg.tar.zst" -F "uuid=${{ env.uuid }}" ${{ secrets.GENURL }}/save_custom_client || true
+            curl --fail-with-body -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.CALLBACK_TOKEN }}" -F "file=@./output/${{ env.filename }}-${{ matrix.job.arch }}.deb" -F "uuid=${{ env.uuid }}" ${{ env.genurl }}/save_custom_client
+            curl --fail-with-body -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.CALLBACK_TOKEN }}" -F "file=@./output/${{ env.filename }}-${{ matrix.job.arch }}.rpm" -F "uuid=${{ env.uuid }}" ${{ env.genurl }}/save_custom_client
+            curl --fail-with-body -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.CALLBACK_TOKEN }}" -F "file=@./output/${{ env.filename }}-suse-${{ matrix.job.arch }}.rpm" -F "uuid=${{ env.uuid }}" ${{ env.genurl }}/save_custom_client
+            curl --fail-with-body -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.CALLBACK_TOKEN }}" -F "file=@./output/${{ env.filename }}-${{ matrix.job.arch }}.pkg.tar.zst" -F "uuid=${{ env.uuid }}" ${{ env.genurl }}/save_custom_client || true
+
+      - name: Upload Linux packages to Synology WebDAV
+        if: ${{ env.rdgen == 'true' && env.WEBDAV_URL != '' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          python "$RDGEN_ASSET_DIR/upload_webdav.py" \
+            --upload "./output/${{ env.filename }}-${{ matrix.job.arch }}.deb" "${{ env.filename }}-${{ env.VERSION }}-linux-${{ matrix.job.arch }}.deb" \
+            --upload "./output/${{ env.filename }}-${{ matrix.job.arch }}.rpm" "${{ env.filename }}-${{ env.VERSION }}-linux-${{ matrix.job.arch }}.rpm" \
+            --upload "./output/${{ env.filename }}-suse-${{ matrix.job.arch }}.rpm" "${{ env.filename }}-${{ env.VERSION }}-linux-suse-${{ matrix.job.arch }}.rpm" \
+            --upload "./output/${{ env.filename }}-${{ matrix.job.arch }}.pkg.tar.zst" "${{ env.filename }}-${{ env.VERSION }}-linux-${{ matrix.job.arch }}.pkg.tar.zst"
 
       - name: send file to api server
         if: ${{ env.rdgen == 'false' }}
@@ -760,7 +803,7 @@ jobs:
             curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./output/${{ env.filename }}-${{ matrix.job.arch }}.pkg.tar.zst" ${{ env.apiServer }}/api/save_custom_client || true
 
       - name: Upload deb
-        uses: actions/upload-artifact@master
+        uses: actions/upload-artifact@v4
         if: env.UPLOAD_ARTIFACT == 'true'
         with:
           name: ${{ env.filename }}-${{ matrix.job.arch }}.deb
@@ -784,7 +827,7 @@ jobs:
           zip_password: ${{ secrets.ZIP_PASSWORD }}
 
       - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
@@ -842,7 +885,7 @@ jobs:
         if: ${{ env.update_public_key != '' }}
         shell: bash
         run: |
-          curl -sSL -o allow_custom_update.py https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/allow_custom_update.py
+          python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'allow_custom_update.py'), 'allow_custom_update.py')"
           python3 allow_custom_update.py \
             --rustdesk-root . \
             --update-url "${{ env.downloadLink}}/api/version/latest" \
@@ -876,7 +919,7 @@ jobs:
           sed -i "s/\[\"cdylib\", \"staticlib\", \"rlib\"\]/\[\"cdylib\"\]/g" Cargo.toml
 
       - name: Restore bridge files
-        uses: actions/download-artifact@master
+        uses: actions/download-artifact@v4
         with:
           name: bridge-artifact
           path: ./
@@ -980,7 +1023,6 @@ jobs:
           sed -i -e 's|OriginalFilename = "rustdesk.exe"|OriginalFilename = "${{ env.appname }}.exe"|' ./libs/portable/Cargo.toml
           sed -i -e 's|const APP_PREFIX: \&str = "rustdesk";|const APP_PREFIX: \&str = "${{ env.appname }}";|' ./libs/portable/src/main.rs
           find ./src/lang -name "*.rs" -exec sed -i -e 's|RustDesk|${{ env.appname }}|' {} \;
-          sed -i -e '/-p tmpdeb\/usr\/lib\/rustdesk/d' ./build.py
 
       - name: change company name
         if: env.compname != 'Purslane Ltd'
@@ -999,11 +1041,10 @@ jobs:
           sed -i -e 's|Purslane Ltd|${{ env.compname }}|' ./src/main.rs
           
       - name: set server, serverPort, key, and apiserver
-        continue-on-error: true
         shell: bash
         env:
           SERVER_DOMAIN: ${{ env.server }}
-          SERVER_PORT_INPUT: ${{ env.serverPort }}
+          SERVER_PORT_INPUT: ${{ env.serverPort || '21116' }}
           SERVER_KEY: ${{ env.key }}
           API_SERVER: ${{ env.apiServer }}
         run: |
@@ -1055,9 +1096,9 @@ jobs:
           retry_wait_seconds: 15
           shell: bash
           command: |
-            wget https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/allowCustom.py
+            python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'allowCustom.py'), 'allowCustom.py')"
             python allowCustom.py
-            wget https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/removeSetupServerTip.diff
+            python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'removeSetupServerTip.diff'), 'removeSetupServerTip.diff')"
             git apply removeSetupServerTip.diff
             echo -n '${{ env.custom }}' > ./custom_.txt
           
@@ -1103,7 +1144,7 @@ jobs:
           retry_wait_seconds: 15
           shell: bash
           command: |
-            wget https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/xoffline.diff
+            python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'xoffline.diff'), 'xoffline.diff')"
             git apply xoffline.diff
 
       - name: hide-cm
@@ -1115,18 +1156,17 @@ jobs:
           retry_wait_seconds: 15
           shell: bash
           command: |
-            wget https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/hidecm.diff
+            python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'hidecm.diff'), 'hidecm.diff')"
             git apply hidecm.diff
         
       - name: removeNewVersionNotif
-        continue-on-error: true
         if: env.removeNewVersionNotif == 'true'
         run: | 
           sed -i -e 's|updateUrl.isNotEmpty|false|' ./flutter/lib/desktop/pages/desktop_home_page.dart
-          #sed -i '/let (request, url) =/,/Ok(())/{/Ok(())/!d}' ./src/common.rs
+          python -c "import os, runpy; runpy.run_path(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'disable_update_check.py'), run_name='__main__')"
 
       - name: Restore bridge files
-        uses: actions/download-artifact@master
+        uses: actions/download-artifact@v4
         with:
           name: bridge-artifact
           path: ./
@@ -1213,9 +1253,9 @@ jobs:
               esac
             done
 
-            sed -ie "s|\(systemctl\s\+\S\+\s\){app_name}|\1${{ env.appname }}|g" src/platform/linux.rs
-            sed -ie 's|\({home}/{p}/{app_name0}2\?.toml\)|\\"\1\\"|g' src/platform/linux.rs
-            sed -ie 's|\(/root/{p}/\)|\\"\1\\"|g' src/platform/linux.rs
+            sed -i -e "s|\(systemctl\s\+\S\+\s\){app_name}|\1${{ env.appname }}|g" src/platform/linux.rs
+            sed -i -e 's|\({home}/{p}/{app_name0}2\?.toml\)|\\"\1\\"|g' src/platform/linux.rs
+            sed -i -e 's|\(/root/{p}/\)|\\"\1\\"|g' src/platform/linux.rs
 
             cargo build --locked --lib --features "$FEATURES" --release
             rm -rf target/release/deps target/release/build
@@ -1258,9 +1298,9 @@ jobs:
             fi
 
             if [ "${{ env.appname }}" != "rustdesk" ]; then
-                sed -ie "s|\(cp .* \)tmpdeb/usr/share/rustdesk/files/systemd/|\1tmpdeb/usr/share/rustdesk/files/systemd/${{ env.appname }}.service|g" build.py
-                sed -ie "s|cp -r \(.\+\)\* \([^ ]\+\)/rustdesk|mv \1rustdesk \1${{ env.appname }}; cp -r \1\* \2/${{ env.appname }}|g" build.py
-                sed -ie "s|\(tmpdeb/[^ ]*\)rustdesk|\1${{ env.appname }}|g" build.py
+                sed -i -e "s|\(cp .* \)tmpdeb/usr/share/rustdesk/files/systemd/|\1tmpdeb/usr/share/rustdesk/files/systemd/${{ env.appname }}.service|g" build.py
+                sed -i -e "s|cp -r \(.\+\)\* \([^ ]\+\)/rustdesk|mv \1rustdesk \1${{ env.appname }}; cp -r \1\* \2/${{ env.appname }}|g" build.py
+                sed -i -e "s|\(tmpdeb/[^ ]*\)rustdesk|\1${{ env.appname }}|g" build.py
                 # The rename above is greedy in \1, so it rewrites only the LAST
                 # "rustdesk" of each path and leaves build.py's globs pointing where the
                 # staging tree never exists. Three corrections, all confined to the drm
@@ -1269,37 +1309,36 @@ jobs:
                 #
                 # 1. Directory component: the cp -r rename above stages into
                 #    tmpdeb/usr/share/<appname>/, but the globs kept usr/share/rustdesk/.
-                sed -ie "s|tmpdeb/usr/share/rustdesk/|tmpdeb/usr/share/${{ env.appname }}/|g" build.py
+                sed -i -e "s|tmpdeb/usr/share/rustdesk/|tmpdeb/usr/share/${{ env.appname }}/|g" build.py
                 # 2. Library filename: build.py renames only the executable and copies the
                 #    bundle verbatim, so the cdylib stays librustdesk.so. The greedy sed
                 #    renamed it to lib<appname>.so, and that is the file carrying the drm
                 #    marker -- the thin Flutter launcher does not.
-                sed -ie "s|lib/lib${{ env.appname }}\.so|lib/librustdesk.so|g" build.py
+                sed -i -e "s|lib/lib${{ env.appname }}\.so|lib/librustdesk.so|g" build.py
                 # 3. libdrmtap must NOT be renamed: drmtap_dl.rs dlopens the absolute path
                 #    /usr/lib/rustdesk/libdrmtap.so.0, compiled into the binary and
                 #    rewritten by nothing here. Staging it under /usr/lib/<appname>/
                 #    packages and installs cleanly, then never loads on the user's machine.
-                sed -ie "s|tmpdeb/usr/lib/${{ env.appname }}|tmpdeb/usr/lib/rustdesk|g" build.py
-                sed -ie "s|Package: rustdesk|Package: ${{ env.appname }}|g" build.py
-                sed -ie "s|RustDesk|${{ env.appname }}|g" res/rustdesk.desktop
+                sed -i -e "s|tmpdeb/usr/lib/${{ env.appname }}|tmpdeb/usr/lib/rustdesk|g" build.py
+                sed -i -e "s|Package: rustdesk|Package: ${{ env.appname }}|g" build.py
+                sed -i -e "s|RustDesk|${{ env.appname }}|g" res/rustdesk.desktop
                 FILES=$(sed -ne "s~.*cp\s\(../\)\?\+\(.\+\.\(desktop\|service\)\)\s\+tmpdeb/.*~\2~p" build.py | sort | uniq)
-                FILES=$(echo -e "$FILES\n$(ls --color=never res/DEBIAN/*)")
-                for FILE in $(echo $FILES | sed "s/\n/ /g"); do
-                  sed -ie "s|rustdesk|${{ env.appname }}|g" $FILE
-                done
-                mkdir -p %{buildroot}/tmpdeb/usr/lib/rustdesk
+                FILES=$(printf '%s\n' "$FILES" res/DEBIAN/* | tr -d '\r')
+                while IFS= read -r FILE; do
+                  [ -n "$FILE" ] || continue
+                  sed -i -e "s|rustdesk|${{ env.appname }}|g" "$FILE"
+                done <<< "$FILES"
                 for file in "./res/rpm-flutter.spec" "./res/rpm-flutter-suse.spec"; do
-                  sed -ie "s|^\(URL:\s*\).*|\1${{ env.downloadLink }}|g" "$file"
-                  sed -ie "s|^\(Vendor:\s*\).*|\1${{ env.compname }}|g" "$file"
-                  sed -ie '/\${\?HBB}\?/!{/\(^Name:\|\/usr\|\/etc\|systemctl\)/s|rustdesk|${{ env.appname }}|g}' "$file"
-                  sed -ie '/\${\?HBB}\?/{/^install/s|\(\/usr\/.*\/\)rustdesk|\1${{ env.appname }}|g}' "$file"
-                  sed -ie '/\${\?HBB}\?/{/^mkdir/s|rustdesk|${{ env.appname }}|g}' "$file"
+                  sed -i -e "s|^\(URL:\s*\).*|\1${{ env.downloadLink }}|g" "$file"
+                  sed -i -e "s|^\(Vendor:\s*\).*|\1${{ env.compname }}|g" "$file"
+                  sed -i -e '/\${\?HBB}\?/!{/\(^Name:\|\/usr\|\/etc\|systemctl\)/s|rustdesk|${{ env.appname }}|g}' "$file"
+                  sed -i -e '/\${\?HBB}\?/{/^install/s|\(\/usr\/.*\/\)rustdesk|\1${{ env.appname }}|g}' "$file"
+                  sed -i -e '/\${\?HBB}\?/{/^mkdir/s|rustdesk|${{ env.appname }}|g}' "$file"
                   for extension in ".desktop" "-link.desktop" ".service"; do
-                    sed -ie "/^%files$/i\mv %{buildroot}/usr/share/${{ env.appname }}/files/rustdesk$extension %{buildroot}/usr/share/${{ env.appname }}/files/${{ env.appname }}$extension" "$file"
-                    sed -ie "/^%files$/i\sed -ie 's|RustDesk|${{ env.appname }}|g' %{buildroot}/usr/share/${{ env.appname }}/files/${{ env.appname }}$extension" "$file"
-                    sed -ie "/^%files$/i\sed -ie 's|rustdesk|${{ env.appname }}|g' %{buildroot}/usr/share/${{ env.appname }}/files/${{ env.appname }}$extension" "$file"
+                    sed -i -e "/^%files$/i\mv %{buildroot}/usr/share/${{ env.appname }}/files/rustdesk$extension %{buildroot}/usr/share/${{ env.appname }}/files/${{ env.appname }}$extension" "$file"
+                    sed -i -e "/^%files$/i\sed -i -e 's|RustDesk|${{ env.appname }}|g' %{buildroot}/usr/share/${{ env.appname }}/files/${{ env.appname }}$extension" "$file"
+                    sed -i -e "/^%files$/i\sed -i -e 's|rustdesk|${{ env.appname }}|g' %{buildroot}/usr/share/${{ env.appname }}/files/${{ env.appname }}$extension" "$file"
                   done
-                  sed -ie '/^%files$/i\\n' "$file"
                 done
             fi
 
@@ -1307,6 +1346,15 @@ jobs:
             for name in *.deb; do
               mv "$name" /workspace/output/"${{ env.filename }}-unattended-wayland-x86_64.deb"
             done
+
+      - name: Preserve verification packages
+        if: inputs.verify_only && env.DRM_SUPPORTED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-linux-drm
+          path: ./output/*
+          if-no-files-found: error
+          retention-days: 7
 
       - name: send file to rdgen server
         if: ${{ env.rdgen == 'true' }}
@@ -1317,7 +1365,15 @@ jobs:
           retry_wait_seconds: 15
           shell: bash
           command: |
-            curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./output/${{ env.filename }}-unattended-wayland-x86_64.deb" -F "uuid=${{ env.uuid }}" ${{ secrets.GENURL }}/save_custom_client
+            curl --fail-with-body -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.CALLBACK_TOKEN }}" -F "file=@./output/${{ env.filename }}-unattended-wayland-x86_64.deb" -F "uuid=${{ env.uuid }}" ${{ env.genurl }}/save_custom_client
+
+      - name: Upload Linux DRM package to Synology WebDAV
+        if: ${{ env.rdgen == 'true' && env.WEBDAV_URL != '' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          python "$RDGEN_ASSET_DIR/upload_webdav.py" \
+            --upload "./output/${{ env.filename }}-unattended-wayland-x86_64.deb" "${{ env.filename }}-${{ env.VERSION }}-linux-unattended-wayland-x86_64.deb"
 
       - name: send file to api server
         if: ${{ env.rdgen == 'false' }}
@@ -1331,7 +1387,7 @@ jobs:
             curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./output/${{ env.filename }}-unattended-wayland-x86_64.deb" ${{ env.apiServer }}/api/save_custom_client
 
       - name: Upload deb
-        uses: actions/upload-artifact@master
+        uses: actions/upload-artifact@v4
         if: ${{ env.UPLOAD_ARTIFACT == 'true' && env.DRM_SUPPORTED == 'true' }}
         with:
           name: ${{ env.filename }}-unattended-wayland-x86_64.deb
@@ -1389,14 +1445,14 @@ jobs:
         if: ${{ env.update_public_key != '' }}
         shell: bash
         run: |
-          curl -sSL -o allow_custom_update.py https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/allow_custom_update.py
+          python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'allow_custom_update.py'), 'allow_custom_update.py')"
           python3 allow_custom_update.py \
             --rustdesk-root . \
             --update-url "${{ env.downloadLink}}/api/version/latest" \
             --ed25519-public-key "${{ env.update_public_key }}"
 
       - name: Download Binary
-        uses: actions/download-artifact@master
+        uses: actions/download-artifact@v4
         with:
           name: ${{ env.filename }}-${{ matrix.job.arch }}.deb
           path: .
@@ -1452,7 +1508,7 @@ jobs:
             # because `appimage/*` globs it too, and sed over an ar archive rewrites
             # bytes inside it.
             mv appimage/rustdesk.deb "${RUNNER_TEMP}/appimage-payload.deb"
-            sed -ie "s|rustdesk|${{ env.appname }}|g" appimage/*
+            sed -i -e "s|rustdesk|${{ env.appname }}|g" appimage/*
             mv "${RUNNER_TEMP}/appimage-payload.deb" "appimage/${{ env.appname }}.deb"
           fi
           sudo apt-get update -y
@@ -1477,6 +1533,15 @@ jobs:
           sudo mv "$src" "./$dest"
           popd
 
+      - name: Preserve verification packages
+        if: inputs.verify_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-appimage-${{ matrix.job.arch }}
+          path: ./appimage/*.AppImage
+          if-no-files-found: error
+          retention-days: 7
+
       - name: send file to rdgen server
         if: ${{ env.rdgen == 'true' }}
         uses: nick-fields/retry@v3
@@ -1486,7 +1551,15 @@ jobs:
           retry_wait_seconds: 15
           shell: bash
           command: |
-            curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./appimage/${{ env.filename }}-${{ matrix.job.arch }}.AppImage" -F "uuid=${{ env.uuid }}" ${{ secrets.GENURL }}/save_custom_client
+            curl --fail-with-body -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.CALLBACK_TOKEN }}" -F "file=@./appimage/${{ env.filename }}-${{ matrix.job.arch }}.AppImage" -F "uuid=${{ env.uuid }}" ${{ env.genurl }}/save_custom_client
+
+      - name: Upload Linux AppImage to Synology WebDAV
+        if: ${{ env.rdgen == 'true' && env.WEBDAV_URL != '' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          python "$RDGEN_ASSET_DIR/upload_webdav.py" \
+            --upload "./appimage/${{ env.filename }}-${{ matrix.job.arch }}.AppImage" "${{ env.filename }}-${{ env.VERSION }}-linux-${{ matrix.job.arch }}.AppImage"
           
       - name: send file to api server
         if: ${{ env.rdgen == 'false' }}
@@ -1565,14 +1638,14 @@ jobs:
         if: ${{ env.update_public_key != '' }}
         shell: bash
         run: |
-          curl -sSL -o allow_custom_update.py https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/allow_custom_update.py
+          python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'allow_custom_update.py'), 'allow_custom_update.py')"
           python3 allow_custom_update.py \
             --rustdesk-root . \
             --update-url "${{ env.downloadLink}}/api/version/latest" \
             --ed25519-public-key "${{ env.update_public_key }}"
 
       - name: Download Binary
-        uses: actions/download-artifact@master
+        uses: actions/download-artifact@v4
         with:
           name: ${{ env.filename }}-${{ matrix.job.arch }}.deb
           path: .
@@ -1609,19 +1682,19 @@ jobs:
               # <appname>.deb by the seds below, so the file must carry that name, and
               # the deb is moved aside first because `flatpak/*` globs it too.
               mv flatpak/rustdesk.deb /tmp/flatpak-payload.deb
-              sed -ie "s|rustdesk|@@RDGEN_FLAT_0@@|g" flatpak/*
-              sed -ie "s|RustDesk|@@RDGEN_FLAT_1@@|g" flatpak/*
-              sed -ie "s|@@RDGEN_FLAT_0@@|${{ env.appname }}|g" flatpak/*
-              sed -ie "s|@@RDGEN_FLAT_1@@|${{ env.appname }}|g" flatpak/*
+              sed -i -e "s|rustdesk|@@RDGEN_FLAT_0@@|g" flatpak/*
+              sed -i -e "s|RustDesk|@@RDGEN_FLAT_1@@|g" flatpak/*
+              sed -i -e "s|@@RDGEN_FLAT_0@@|${{ env.appname }}|g" flatpak/*
+              sed -i -e "s|@@RDGEN_FLAT_1@@|${{ env.appname }}|g" flatpak/*
               mv /tmp/flatpak-payload.deb "flatpak/${{ env.appname }}.deb"
               # The manifest's other source is the metainfo file. Those same seds rewrote
               # the REFERENCE to it without renaming the file on disk, so only the name
               # is left to fix; its contents are already rewritten.
               FLAT="$(echo "${{ env.appname }}" | tr -d ' ')"
               BUNDLE_ID="com.${FLAT}.${FLAT}"
-              sed -ie "s|\"id\": \"com[^\"]*\"|\"id\": \"${BUNDLE_ID}\"|" flatpak/rustdesk.json
-              sed -ie "s|\"path\": \"com[^\"]*\.metainfo\.xml\"|\"path\": \"${BUNDLE_ID}.metainfo.xml\"|" flatpak/rustdesk.json
-              sed -ie "s|<id>com[^<]*</id>|<id>${BUNDLE_ID}</id>|" flatpak/*.metainfo.xml
+              sed -i -e "s|\"id\": \"com[^\"]*\"|\"id\": \"${BUNDLE_ID}\"|" flatpak/rustdesk.json
+              sed -i -e "s|\"path\": \"com[^\"]*\.metainfo\.xml\"|\"path\": \"${BUNDLE_ID}.metainfo.xml\"|" flatpak/rustdesk.json
+              sed -i -e "s|<id>com[^<]*</id>|<id>${BUNDLE_ID}</id>|" flatpak/*.metainfo.xml
               mv flatpak/com.rustdesk.RustDesk.metainfo.xml \
                  "flatpak/${BUNDLE_ID}.metainfo.xml"
             fi
@@ -1636,6 +1709,15 @@ jobs:
             flatpak-builder --user --install-deps-from=flathub -y --force-clean --repo=repo ./build ./rustdesk.json
             flatpak build-bundle ./repo ${{ env.filename }}-${{ matrix.job.arch }}.flatpak "$BUNDLE_ID"
 
+      - name: Preserve verification packages
+        if: inputs.verify_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-flatpak-${{ matrix.job.arch }}
+          path: ./flatpak/*.flatpak
+          if-no-files-found: error
+          retention-days: 7
+
       - name: send file to rdgen server
         if: ${{ env.rdgen == 'true' }}
         uses: nick-fields/retry@v3
@@ -1645,7 +1727,15 @@ jobs:
           retry_wait_seconds: 15
           shell: bash
           command: |
-            curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./flatpak/${{ env.filename }}-${{ matrix.job.arch }}.flatpak" -F "uuid=${{ env.uuid }}" ${{ secrets.GENURL }}/save_custom_client
+            curl --fail-with-body -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.CALLBACK_TOKEN }}" -F "file=@./flatpak/${{ env.filename }}-${{ matrix.job.arch }}.flatpak" -F "uuid=${{ env.uuid }}" ${{ env.genurl }}/save_custom_client
+
+      - name: Upload Linux Flatpak to Synology WebDAV
+        if: ${{ env.rdgen == 'true' && env.WEBDAV_URL != '' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          python "$RDGEN_ASSET_DIR/upload_webdav.py" \
+            --upload "./flatpak/${{ env.filename }}-${{ matrix.job.arch }}.flatpak" "${{ env.filename }}-${{ env.VERSION }}-linux-${{ matrix.job.arch }}.flatpak"
           
       - name: send file to api server
         if: ${{ env.rdgen == 'false' }}
@@ -1676,13 +1766,13 @@ jobs:
           zip_password: ${{ secrets.ZIP_PASSWORD }}
 
       - name: Finalize and Cleanup zip/json
-        if: always() # Run even if previous steps fail
+        if: always() && env.rdgen != 'verify' && env.genurl != ''
         continue-on-error: true
         uses: fjogeleit/http-request-action@v1
         with:
-          url: "${{ secrets.GENURL }}/cleanzip"
+          url: "${{ env.genurl }}/cleanzip"
           method: 'POST'
-          customHeaders: '{"Content-Type": "application/json"}'
+          customHeaders: '{"Content-Type": "application/json", "Authorization": "Bearer ${{ env.CALLBACK_TOKEN }}"}'
           data: '{"uuid": "${{ env.uuid }}"}'
 
       - name: Set rdgen value
@@ -1695,18 +1785,33 @@ jobs:
         run: |
           echo "STATUS_URL=${{ env.apiServer }}/api/updategh" >> $GITHUB_ENV
 
-      - uses: geekyeggo/delete-artifact@v5
-        continue-on-error: true
-        with:
-            name: ${{ env.filename }}-*.deb
-
   cleanup:
-    needs: [build-rustdesk-linux,build-flatpak,build-appimage,deploy]
+    needs: [build-rustdesk-linux,build-rustdesk-linux-drm,build-flatpak,build-appimage,deploy]
     runs-on: ubuntu-latest
-    continue-on-error: true
     if: always()
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Delete private input bundle asset
+        if: ${{ inputs.bundle_asset_id != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${{ inputs.bundle_asset_id }}"
       - name: Delete secrets artifact
         uses: geekyeggo/delete-artifact@v5
         with:
           name: encrypted-secrets-zip
+      - name: Notify WeCom
+        if: always() && !inputs.verify_only
+        continue-on-error: true
+        uses: ./.github/actions/notify-wecom
+        with:
+          platform: Linux
+          version: ${{ inputs.version }}
+          status: ${{ needs.build-rustdesk-linux.result == 'success' && needs.build-rustdesk-linux-drm.result == 'success' && needs.build-flatpak.result == 'success' && needs.build-appimage.result == 'success' && needs.deploy.result == 'success' && 'success' || 'failure' }}
+        env:
+          WECHAT_WORK_CORP_ID: ${{ secrets.WECHAT_WORK_CORP_ID }}
+          WECHAT_WORK_AGENT_ID: ${{ secrets.WECHAT_WORK_AGENT_ID }}
+          WECHAT_WORK_SECRET: ${{ secrets.WECHAT_WORK_SECRET }}
+          WECHAT_WORK_TOUSER: ${{ secrets.WECHAT_WORK_TOUSER }}

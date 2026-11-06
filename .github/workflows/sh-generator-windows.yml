@@ -1,5 +1,8 @@
 name: Custom Windows Client Generator
 run-name: Custom Windows Client Generator
+permissions:
+  actions: write
+  contents: write
 on: 
   workflow_dispatch:
     inputs:
@@ -13,6 +16,21 @@ on:
         required: true
         default: ''
         type: string
+      zip_b64:
+        description: 'base64 encoded encrypted input bundle'
+        required: false
+        default: ''
+        type: string
+      bundle_asset_id:
+        description: 'private GitHub release asset ID for encrypted inputs'
+        required: false
+        default: ''
+        type: string
+      verify_only:
+        description: 'Build a synthetic client without callbacks, NAS upload or notifications'
+        type: boolean
+        required: false
+        default: false
       app_version:
         description: 'custom app version string (overrides build version)'
         required: false
@@ -31,7 +49,6 @@ env:
   ANDROID_FLUTTER_VERSION: "3.24.5" 
   # for arm64 linux because official Dart SDK does not work
   FLUTTER_ELINUX_VERSION: "3.16.9"
-  TAG_NAME: "${{ inputs.upload-tag }}"
   VCPKG_BINARY_SOURCES: "clear"
   # vcpkg version: 2024.07.12
   VCPKG_COMMIT_ID: "${{ inputs.version == 'master' && '9e593bb18ea69cc5095e012465dcd675a822ed0d' || '120deac3062162151622ca4860575a33844ba10b' }}"
@@ -43,6 +60,10 @@ env:
   MACOS_P12_BASE64: "${{ secrets.MACOS_P12_BASE64 }}"
   UPLOAD_ARTIFACT: 'true'
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}"
+  WEBDAV_URL: "${{ secrets.WEBDAV_URL }}"
+  WEBDAV_USER: "${{ secrets.WEBDAV_USER }}"
+  WEBDAV_PASS: "${{ secrets.WEBDAV_PASS }}"
+  WEBDAV_DIR: "${{ secrets.WEBDAV_DIR }}"
   STATUS_URL: "${{ secrets.GENURL }}/updategh"
 
 
@@ -51,6 +72,11 @@ jobs:
     uses: ./.github/workflows/fetch-encrypted-secrets.yml
     with:
       zip_url_json: ${{ inputs.zip_url }}
+      zip_b64: ${{ inputs.zip_b64 }}
+      bundle_asset_id: ${{ inputs.bundle_asset_id }}
+      verify_only: ${{ inputs.verify_only }}
+    secrets:
+      ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
 
   generate-bridge:
     uses: ./.github/workflows/bridge.yml
@@ -102,17 +128,17 @@ jobs:
           zip_password: ${{ secrets.ZIP_PASSWORD }}
 
       - name: Finalize and Cleanup zip/json
-        if: always() # Run even if previous steps fail
+        if: always() && env.rdgen != 'verify' && env.genurl != ''
         continue-on-error: true
         uses: fjogeleit/http-request-action@v1
         with:
-          url: "${{ secrets.GENURL }}/cleanzip"
+          url: "${{ env.genurl }}/cleanzip"
           method: 'POST'
-          customHeaders: '{"Content-Type": "application/json"}'
+          customHeaders: '{"Content-Type": "application/json", "Authorization": "Bearer ${{ env.CALLBACK_TOKEN }}"}'
           data: '{"uuid": "${{ env.uuid }}"}'
 
       - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
@@ -157,14 +183,14 @@ jobs:
         if: ${{ env.update_public_key != '' }}
         shell: bash
         run: |
-          curl -sSL -o allow_custom_update.py https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/allow_custom_update.py
+          python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'allow_custom_update.py'), 'allow_custom_update.py')"
           python3 allow_custom_update.py \
             --rustdesk-root . \
             --update-url "${{ env.downloadLink}}/api/version/latest" \
             --ed25519-public-key "${{ env.update_public_key }}"
 
       - name: Restore bridge files
-        uses: actions/download-artifact@master
+        uses: actions/download-artifact@v4
         with:
           name: bridge-artifact
           path: ./
@@ -277,11 +303,10 @@ jobs:
           sed -i -e 's|$downloadUrl/$downloadFile|${{ env.downloadLink }}|' ./flutter/lib/desktop/widgets/update_progress.dart
 
       - name: set server, serverPort, key, and apiserver
-        continue-on-error: true
         shell: bash
         env:
           SERVER_DOMAIN: ${{ env.server }}
-          SERVER_PORT_INPUT: ${{ env.serverPort }}
+          SERVER_PORT_INPUT: ${{ env.serverPort || '21116' }}
           SERVER_KEY: ${{ env.key }}
           API_SERVER: ${{ env.apiServer }}
         run: |
@@ -334,10 +359,10 @@ jobs:
           max_attempts: 3
           shell: pwsh
           command: |
-            Invoke-WebRequest -Uri https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/allowCustom.py -OutFile allowCustom.py
+            python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'allowCustom.py'), 'allowCustom.py')"
             python allowCustom.py
             # Remove Setup Server Tip
-            Invoke-WebRequest -Uri https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/removeSetupServerTip.diff -OutFile removeSetupServerTip.diff
+            python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'removeSetupServerTip.diff'), 'removeSetupServerTip.diff')"
             git apply removeSetupServerTip.diff  
 
       - name: Patch remote printer port to spool file
@@ -357,13 +382,13 @@ jobs:
               if "printer-spool" in t:
                   print("Rust printer port already points to spool file")
               else:
-                  old = ('fn get_port_name(app_name: &str) -> Vec<u16> {\n'
+                  old = ('fn get_port_name(app_name: &str) -> Vec<u16> {\r\n'
                          '    format!("{} Printer", app_name)')
-                  new = ('fn get_port_name(app_name: &str) -> Vec<u16> {\n'
-                         '    let base = std::env::var("ProgramData")\n'
-                         '        .unwrap_or_else(|_| "C:\\\\ProgramData".to_string());\n'
-                         '    let dir = format!("{}\\\\{}\\\\printer-spool", base, app_name);\n'
-                         '    let _ = std::fs::create_dir_all(&dir);\n'
+                  new = ('fn get_port_name(app_name: &str) -> Vec<u16> {\r\n'
+                         '    let base = std::env::var("ProgramData")\r\n'
+                         '        .unwrap_or_else(|_| "C:\\\\ProgramData".to_string());\r\n'
+                         '    let dir = format!("{}\\\\{}\\\\printer-spool", base, app_name);\r\n'
+                         '    let _ = std::fs::create_dir_all(&dir);\r\n'
                          '    format!("{}\\\\job.prn", dir)')
                   if old in t:
                       with open(rs, "w", encoding="utf-8") as f:
@@ -448,16 +473,15 @@ jobs:
           shell: pwsh
           continue_on_error: true
           command: |
-            Invoke-WebRequest -Uri https://raw.githubusercontent.com/bryangerlach/rdgen/refs/heads/master/.github/patches/xoffline.diff -OutFile xoffline.diff
+            python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'xoffline.diff'), 'xoffline.diff')"
             git apply xoffline.diff
 
       - name: removeNewVersionNotif
-        continue-on-error: true
         if: env.removeNewVersionNotif == 'true'
         shell: bash
         run: | 
           sed -i -e 's|updateUrl.isNotEmpty|false|' ./flutter/lib/desktop/pages/desktop_home_page.dart
-          #sed -i '/let (request, url) =/,/Ok(())/{/Ok(())/!d}' ./src/common.rs
+          python -c "import os, runpy; runpy.run_path(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'disable_update_check.py'), run_name='__main__')"
 
       - name: replace flutter icons
         if: ${{ env.iconlink_url != 'false' }}
@@ -472,8 +496,8 @@ jobs:
       - name: Checkout printer-adapter crate
         uses: actions/checkout@v4
         with:
-          repository: bryangerlach/rdgen
-          ref: master
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
           path: ./temp-repo
 
       - name: Move printer-adapter into place
@@ -561,7 +585,7 @@ jobs:
           fi
 
       - name: Download RustDeskTempTopMostWindow artifacts
-        uses: actions/download-artifact@master
+        uses: actions/download-artifact@v4
         if: env.UPLOAD_ARTIFACT == 'true'
         with:
           name: topmostwindow-artifacts
@@ -667,6 +691,15 @@ jobs:
         run: |
           mv ./SignOutput/rustdesk.msi "./SignOutput/${{ env.filename }}.msi" || echo "rustdesk"
 
+      - name: Preserve verification packages
+        if: inputs.verify_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-windows-self-hosted
+          path: ./SignOutput/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
       - name: send file to rdgen server
         if: ${{ env.rdgen == 'true' }}
         uses: nick-fields/retry@v3
@@ -675,8 +708,17 @@ jobs:
           max_attempts: 3
           shell: bash
           command: |
-            curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./SignOutput/${{ env.filename }}.exe" -F "uuid=${{ env.uuid }}" ${{ secrets.GENURL }}/save_custom_client
-            curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./SignOutput/${{ env.filename }}.msi" -F "uuid=${{ env.uuid }}" ${{ secrets.GENURL }}/save_custom_client || true
+            curl --fail-with-body -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.CALLBACK_TOKEN }}" -F "file=@./SignOutput/${{ env.filename }}.exe" -F "uuid=${{ env.uuid }}" ${{ env.genurl }}/save_custom_client
+            curl --fail-with-body -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.CALLBACK_TOKEN }}" -F "file=@./SignOutput/${{ env.filename }}.msi" -F "uuid=${{ env.uuid }}" ${{ env.genurl }}/save_custom_client || true
+
+      - name: Upload self-hosted Windows packages to Synology WebDAV
+        if: ${{ env.rdgen == 'true' && env.WEBDAV_URL != '' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          python "$RDGEN_ASSET_DIR/upload_webdav.py" \
+            --upload "./SignOutput/${{ env.filename }}.exe" "${{ env.filename }}-${{ env.VERSION }}-windows-self-hosted.exe" \
+            --upload "./SignOutput/${{ env.filename }}.msi" "${{ env.filename }}-${{ env.VERSION }}-windows-self-hosted.msi"
 
       - name: send file to api server
         if: ${{ env.rdgen == 'false' }}
@@ -692,10 +734,30 @@ jobs:
   cleanup:
     needs: [build-for-windows-flutter]
     runs-on: ubuntu-latest
-    continue-on-error: true
     if: always()
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Delete private input bundle asset
+        if: ${{ inputs.bundle_asset_id != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${{ inputs.bundle_asset_id }}"
       - name: Delete secrets artifact
         uses: geekyeggo/delete-artifact@v5
         with:
           name: encrypted-secrets-zip
+      - name: Notify WeCom
+        if: always() && !inputs.verify_only
+        continue-on-error: true
+        uses: ./.github/actions/notify-wecom
+        with:
+          platform: Windows self-hosted
+          version: ${{ inputs.version }}
+          status: ${{ needs.build-for-windows-flutter.result == 'success' && 'success' || 'failure' }}
+        env:
+          WECHAT_WORK_CORP_ID: ${{ secrets.WECHAT_WORK_CORP_ID }}
+          WECHAT_WORK_AGENT_ID: ${{ secrets.WECHAT_WORK_AGENT_ID }}
+          WECHAT_WORK_SECRET: ${{ secrets.WECHAT_WORK_SECRET }}
+          WECHAT_WORK_TOUSER: ${{ secrets.WECHAT_WORK_TOUSER }}

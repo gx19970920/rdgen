@@ -1,9 +1,10 @@
 import json
-import os
-import re
 from django.http import JsonResponse
-from django.conf import settings as _settings
-from .views import generate_custom_client, _get_run_status, _UUID_RE
+from django.views.decorators.csrf import csrf_exempt
+from django.core.exceptions import ValidationError
+from .forms import UNSAFE_NAME_CHARS, GenerateForm
+from .build_validation import build_parameter_error
+from .views import generate_custom_client, _get_run_status, _public_base_url
 
 
 # Field validation constraints (mirrored from GenerateForm)
@@ -29,12 +30,11 @@ BOOL_FIELDS = [
 
 # Optional string fields (no validation needed, just accept as-is)
 OPTIONAL_STR_FIELDS = [
-    'sh_secret_field', 'serverIP', 'serverPort', 'key', 'apiServer', 'urlLink', 'downloadLink',
+    'sh_secret_field', 'serverIP', 'key', 'apiServer', 'urlLink', 'downloadLink',
+    'app_version', 'serverPort',
     'appname', 'compname', 'androidappid', 'permanentPassword',
     'defaultManual', 'overrideManual',
     'iconbase64', 'logobase64', 'privacybase64',
-    'update_public_key',
-    'app_version',
 ]
 
 
@@ -51,10 +51,14 @@ def validate_generate_params(data):
 
     # Required string field
     exename = data.get('exename', '')
-    if not exename:
+    if not isinstance(exename, str):
+        errors['exename'] = 'Must be a string value.'
+    elif not exename.strip():
         errors['exename'] = 'This field is required.'
+    elif len(exename) > 128:
+        errors['exename'] = 'Must be 128 characters or fewer.'
     else:
-        cleaned['exename'] = exename
+        cleaned['exename'] = exename.strip()
 
     # Choice fields
     choice_validations = {
@@ -79,10 +83,6 @@ def validate_generate_params(data):
     # Boolean fields
     for field in BOOL_FIELDS:
         value = data.get(field, False)
-        
-        if isinstance(value, str) and value.lower() == 'on':
-            value = True
-            
         if not isinstance(value, bool):
             errors[field] = 'Must be a boolean value.'
         else:
@@ -90,17 +90,25 @@ def validate_generate_params(data):
 
     # Optional string fields
     for field in OPTIONAL_STR_FIELDS:
-        cleaned[field] = data.get(field, '')
+        value = data.get(field, '')
+        if not isinstance(value, str):
+            errors[field] = 'Must be a string value.'
+        elif field not in {'iconbase64', 'logobase64', 'privacybase64'} and len(value) > 4096:
+            errors[field] = 'Must be 4096 characters or fewer.'
+        elif field in {'appname', 'compname'} and UNSAFE_NAME_CHARS.search(value):
+            errors[field] = 'Contains characters unsupported in build scripts.'
+        elif build_parameter_error(field, value):
+            errors[field] = build_parameter_error(field, value)
+        else:
+            cleaned[field] = value
 
-    # Free-text names flow into single/double-quoted bash sed scripts
-    # (same rule as GenerateForm.clean_appname/clean_compname).
-    for field in ('appname', 'compname'):
-        value = cleaned.get(field, '')
-        if isinstance(value, str) and re.search(r'[&\\|\'"$`\r\n]', value):
-            errors[field] = (
-                'Contains characters unsupported in build scripts '
-                '(& \\ | \' " $ `, newlines).'
+    if 'app_version' not in errors:
+        try:
+            cleaned['app_version'] = GenerateForm.base_fields['app_version'].clean(
+                cleaned.get('app_version', '')
             )
+        except ValidationError:
+            errors['app_version'] = 'Must be a numeric version such as 1.5.1 or 1.5.1+20.'
 
     # File fields are not used in API mode (base64 fields are used instead)
     cleaned['iconfile'] = None
@@ -110,6 +118,7 @@ def validate_generate_params(data):
     return cleaned, errors
 
 
+@csrf_exempt
 def api_generate(request):
     """
     POST /api/generate
@@ -126,112 +135,8 @@ def api_generate(request):
         data = json.loads(request.body)
     except (json.JSONDecodeError, ValueError) as e:
         return JsonResponse({"success": False, "error": f"Invalid JSON: {str(e)}"}, status=400)
-
-    # Optional platform override: allows the caller to overwrite the
-    # "platform" key carried in the JSON body (e.g. when the saved config
-    # says "windows" but the build should run as "linux"/"android"). The
-    # override may be supplied as a query parameter or as an additional
-    # field in the request body.
-    PLATFORM_OVERRIDE_KEYS = (
-        'platform', 'set_platform', 'setPlatform', 'platform_override',
-        'override_platform', 'platformOverride', 'overridePlatform',
-        'platform_setting', 'platformSetting',
-    )
-    override_platform = None
-    for key in PLATFORM_OVERRIDE_KEYS:
-        value = request.GET.get(key)
-        if value is not None and value != '':
-            override_platform = value
-            break
-    # Also accept any query parameter whose value is a valid platform choice.
-    if override_platform is None:
-        for key, value in request.GET.items():
-            if isinstance(value, str) and value in PLATFORM_CHOICES:
-                override_platform = value
-                break
-    if override_platform is None and isinstance(data, dict):
-        for key in PLATFORM_OVERRIDE_KEYS:
-            if key in data and data.get(key) not in (None, ''):
-                if key != 'platform':
-                    override_platform = data.get(key)
-                    break
-    # Fall back to a generic scan: any body field (other than "platform")
-    # whose value is a valid platform choice also acts as an override.
-    if override_platform is None and isinstance(data, dict):
-        for key, value in data.items():
-            if key == 'platform':
-                continue
-            key_l = str(key).lower()
-            if not isinstance(value, str) or value not in PLATFORM_CHOICES:
-                continue
-            # Only treat a field as a platform override when its name suggests
-            # that intent, to avoid misreading ordinary fields (e.g. appname)
-            # whose value happens to be a platform name.
-            if ('platform' in key_l or 'override' in key_l or 'set' in key_l
-                    or key_l in ('os', 'target', 'targetos')):
-                override_platform = value
-                break
-
-    if override_platform is not None:
-        if override_platform not in PLATFORM_CHOICES:
-            return JsonResponse({
-                "success": False,
-                "error": "Validation errors",
-                "details": {"platform": f"Invalid choice. Must be one of: {PLATFORM_CHOICES}"}
-            }, status=400)
-        # Make validation + generation honour the override instead of (or
-        # in addition to) the platform already present in the JSON body.
-        if isinstance(data, dict):
-            data = dict(data)
-            data['platform'] = override_platform
-
-    # Optional version override, mirroring the optional platform override.
-    # Any value must be one of VERSION_CHOICES.
-    VERSION_OVERRIDE_KEYS = (
-        'version', 'set_version', 'setVersion', 'version_override',
-        'override_version', 'versionOverride', 'overrideVersion',
-        'version_setting', 'versionSetting',
-    )
-    override_version = None
-    for key in VERSION_OVERRIDE_KEYS:
-        value = request.GET.get(key)
-        if value is not None and value != '':
-            override_version = value
-            break
-    if override_version is None:
-        for key, value in request.GET.items():
-            if isinstance(value, str) and value in VERSION_CHOICES:
-                override_version = value
-                break
-    if override_version is None and isinstance(data, dict):
-        for key in VERSION_OVERRIDE_KEYS:
-            if key in data and data.get(key) not in (None, ''):
-                if key != 'version':
-                    override_version = data.get(key)
-                    break
-    if override_version is None and isinstance(data, dict):
-        for key, value in data.items():
-            if key == 'version':
-                continue
-            if not isinstance(value, str) or value not in VERSION_CHOICES:
-                continue
-            key_l = str(key).lower()
-            if not ('version' in key_l or 'ver' in key_l or 'set' in key_l
-                    or 'override' in key_l or 'release' in key_l):
-                continue
-            override_version = value
-            break
-
-    if override_version is not None:
-        if override_version not in VERSION_CHOICES:
-            return JsonResponse({
-                "success": False,
-                "error": "Validation errors",
-                "details": {"version": f"Invalid choice. Must be one of: {VERSION_CHOICES}"}
-            }, status=400)
-        if isinstance(data, dict):
-            data = dict(data)
-            data['version'] = override_version
+    if not isinstance(data, dict):
+        return JsonResponse({"success": False, "error": "JSON body must be an object."}, status=400)
 
     cleaned, errors = validate_generate_params(data)
     if errors:
@@ -242,7 +147,7 @@ def api_generate(request):
         }, status=400)
 
     # Build full_url the same way as generator_view
-    full_url = f"{_settings.PROTOCOL}://{request.get_host()}" if _settings.GENURL else f"{_settings.PROTOCOL}://{request.get_host()}"
+    full_url = _public_base_url(request)
 
     result = generate_custom_client(cleaned, full_url)
 
@@ -260,8 +165,6 @@ def api_status(request):
 
     Checks the generation status for a given UUID.
     Returns JSON with status, uuid, and optional log_url/filename/platform.
-    On a success status, also returns "files": a list of filenames that were
-    created/saved for this run.
     """
     if request.method != 'GET':
         return JsonResponse({"success": False, "error": "Method not allowed. Use GET."}, status=405)
@@ -287,19 +190,5 @@ def api_status(request):
         response_data['filename'] = filename
     if platform:
         response_data['platform'] = platform
-
-    # Expose the filenames that were actually uploaded/saved for this run so
-    # API consumers can download them. The directory is scanned regardless of
-    # the run status so that any (possibly partial) files are still reported,
-    # including on failure.
-    created_files = []
-    if _UUID_RE.match(uuid_val or ''):
-        run_dir = os.path.join('exe', uuid_val)
-        if os.path.isdir(run_dir):
-            for name in sorted(os.listdir(run_dir)):
-                full_path = os.path.join(run_dir, name)
-                if os.path.isfile(full_path):
-                    created_files.append(name)
-    response_data['files'] = created_files
 
     return JsonResponse(response_data)

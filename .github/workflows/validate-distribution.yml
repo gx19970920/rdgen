@@ -1,0 +1,93 @@
+name: Validate distribution and generator
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - 'agent/distribution-*'
+      - 'codex/**'
+  pull_request:
+    paths:
+      - 'distribution/**'
+      - 'rdgenerator/**'
+      - '.github/actions/**'
+      - '.github/scripts/**'
+      - '.github/workflows/**'
+      - 'requirements.txt'
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt PyYAML
+      - name: Test Django generator
+        run: python manage.py test
+      - name: Test distribution and notifications
+        run: python -m unittest discover -s distribution -p 'test_*.py' -v
+
+  workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate all workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= -pyflakes=
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build production Dockerfile
+        run: docker build -t rdgen:verify .
+      - name: Check application and database migrations in container
+        run: |
+          docker run --rm rdgen:verify python manage.py check
+          docker run --rm rdgen:verify python manage.py migrate --noinput
+      - name: Verify real container startup with production Host settings
+        run: |
+          docker run -d --name rdgen-startup -p 127.0.0.1:18000:8000 \
+            -e GENURL=https://rdgen.example -e ALLOWED_HOSTS=rdgen.example \
+            -e SECRET_KEY=ci-only-not-a-production-secret \
+            -e SECURE_SSL_REDIRECT=true rdgen:verify
+          for attempt in $(seq 1 30); do
+            if docker exec rdgen-startup python -m rdgen.healthcheck; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs rdgen-startup
+          exit 1
+      - name: Remove verification container
+        if: always()
+        run: docker rm -f rdgen-startup || true
+
+  client-patches:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check supported RustDesk release patches
+        run: python .github/scripts/check_client_patches.py
+      - name: Check branded Linux packaging scripts
+        run: |
+          python -m pip install PyYAML
+          python .github/scripts/check_linux_packaging.py

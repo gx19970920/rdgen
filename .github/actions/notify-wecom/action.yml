@@ -1,0 +1,25 @@
+name: Notify WeCom
+description: Send a RustDesk build completion message through a WeCom application.
+
+inputs:
+  platform:
+    description: Human-readable target platform.
+    required: true
+  version:
+    description: RustDesk version that was built.
+    required: true
+  status:
+    description: Whether the workflow completed successfully or failed.
+    required: false
+    default: success
+
+runs:
+  using: composite
+  steps:
+    - name: Send application message
+      shell: bash
+      env:
+        WECOM_PLATFORM: ${{ inputs.platform }}
+        WECOM_VERSION: ${{ inputs.version }}
+        WECOM_STATUS: ${{ inputs.status }}
+      run: python "$GITHUB_ACTION_PATH/send_wecom.py"

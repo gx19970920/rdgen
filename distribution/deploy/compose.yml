@@ -1,0 +1,23 @@
+services:
+  tls-proxy:
+    image: ${DIST_CADDY_IMAGE:?Set the verified local image digest}
+    container_name: rdgen-distribution-proxy
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      DIST_TLS_PORT: ${DIST_TLS_PORT:-8443}
+      DIST_CERT_NAME: ${DIST_CERT_NAME:?Set the certificate filename}
+      DIST_KEY_NAME: ${DIST_KEY_NAME:?Set the key filename}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${DIST_CERT_DIR:?Set certificate directory}:/certs:ro
+      - ./tls:/managed:ro
+      - rdgen-distribution-caddy-data:/data
+      - rdgen-distribution-caddy-config:/config
+    read_only: true
+    tmpfs:
+      - /tmp
+
+volumes:
+  rdgen-distribution-caddy-data:
+  rdgen-distribution-caddy-config:

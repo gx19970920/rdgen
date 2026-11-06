@@ -10,6 +10,7 @@ on:
 
 jobs:
   build:
+    if: vars.DOCKERHUB_USERNAME != ''
     runs-on: ubuntu-latest
     steps:
       - name: set docker image tag

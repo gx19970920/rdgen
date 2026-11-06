@@ -10,6 +10,18 @@ LICENSE
 .github
 .gitignore
 
+# Runtime data and secrets
+.env
+db.sqlite3
+data
+exe
+png
+temp_zips
+
+# Python caches
+__pycache__
+*.pyc
+
 # .gitignore
 *.pyc
 .venv

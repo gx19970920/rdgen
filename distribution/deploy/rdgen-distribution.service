@@ -1,0 +1,24 @@
+[Unit]
+Description=RustDesk distribution storage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rdgen-dist
+Group=rdgen-dist
+WorkingDirectory=/opt/rdgen-distribution
+EnvironmentFile=/opt/rdgen-distribution/runtime.env
+ExecStart=/usr/bin/python3 /opt/rdgen-distribution/server.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/rdgen-distribution/data
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

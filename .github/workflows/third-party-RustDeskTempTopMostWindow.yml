@@ -12,22 +12,22 @@ on:
           default: true
         target:
             description: 'Target'
-            required: true
+            required: false
             type: string
             default: 'windows-2022'
         configuration:
             description: 'Configuration'
-            required: true
+            required: false
             type: string
             default: 'Release'
         platform:
             description: 'Platform'
-            required: true
+            required: false
             type: string
             default: 'x64'
         target_version:
             description: 'TargetVersion'
-            required: true
+            required: false
             type: string
             default: 'Windows10'
 

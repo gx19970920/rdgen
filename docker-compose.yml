@@ -1,24 +1,41 @@
 services:
   rdgen:
-    # use bryangerlach/rdgen:latest for the latest build
-    #build: .
-    image: bryangerlach/rdgen:latest
+    build: .
     restart: unless-stopped
     environment:
-      SECRET_KEY: "django-insecure-!(t-!f#6g#sr%yfded9(xha)g+=!6craeez^cp+*&bz_7vdk61"
-      GHUSER: "github_username"
-      GHBEARER: "github_access_token"
-      GENURL: "accessible_url_of_server"
-      ZIP_PASSWORD: ""
-      GHBRANCH: "master"
-      PROTOCOL: "https"
-      REPONAME: "rdgen"
-      SH_SECRET: ""
+      SECRET_KEY: "${SECRET_KEY:?Set SECRET_KEY in .env}"
+      GHUSER: "${GHUSER:?Set GHUSER in .env}"
+      GHBEARER: "${GHBEARER:?Set GHBEARER in .env}"
+      GENURL: "${GENURL:?Set GENURL in .env}"
+      ZIP_PASSWORD: "${ZIP_PASSWORD:?Set ZIP_PASSWORD in .env and the matching GitHub Actions secret}"
+      CALLBACK_TOKEN: "${CALLBACK_TOKEN:-}"
+      GHBRANCH: "${GHBRANCH:-master}"
+      PROTOCOL: "${PROTOCOL:-https}"
+      REPONAME: "${REPONAME:-rdgen}"
+      SH_SECRET: "${SH_SECRET:-}"
+      WEBDAV_URL: "${WEBDAV_URL:-}"
+      WEBDAV_USER: "${WEBDAV_USER:-}"
+      WEBDAV_PASS: "${WEBDAV_PASS:-}"
+      WEBDAV_DIR: "${WEBDAV_DIR:-}"
+      ALLOWED_HOSTS: "${ALLOWED_HOSTS:-*}"
+      CSRF_TRUSTED_ORIGINS: "${CSRF_TRUSTED_ORIGINS:-}"
+      SECURE_SSL_REDIRECT: "${SECURE_SSL_REDIRECT:-false}"
+      SECURE_HSTS_SECONDS: "${SECURE_HSTS_SECONDS:-0}"
+      SECURE_HSTS_INCLUDE_SUBDOMAINS: "${SECURE_HSTS_INCLUDE_SUBDOMAINS:-false}"
+      SECURE_HSTS_PRELOAD: "${SECURE_HSTS_PRELOAD:-false}"
+      DB_PATH: "/opt/rdgen/data/db.sqlite3"
     ports:
       - "8000:8000"
     dns:
       - 8.8.8.8
     volumes:
-      - ./exe:/opt/rdgen/exe
-      - ./png:/opt/rdgen/png
-      - ./temp_zips:/opt/rdgen/temp_zips
+      - rdgen-exe:/opt/rdgen/exe
+      - rdgen-png:/opt/rdgen/png
+      - rdgen-temp-zips:/opt/rdgen/temp_zips
+      - rdgen-data:/opt/rdgen/data
+
+volumes:
+  rdgen-exe:
+  rdgen-png:
+  rdgen-temp-zips:
+  rdgen-data:

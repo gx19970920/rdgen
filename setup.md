@@ -12,7 +12,7 @@
     * give a token name, change expiration to whatever you want  
     * under Repository access, select Only select repositories, then pick your
       rdgen repo  
-    * give Read and Write access to actions and workflows  
+    * give Read and Write access to actions, contents, and workflows
     * You might have to go to: https://github.com/USERNAME/rdgen/actions and hit green Enable Actions button so it works.
 3. Next, login to your Github account, go to your rdgen repo page (https://github.com/USERNAME/rdgen)
    * Click on Settings
@@ -23,14 +23,19 @@
    * Now click New repository secret again
    * Set the Name to ZIP_PASSWORD
    * Set the Secret to any password you want (use this in the next step as well) - generate a password by running: ```python3 -c 'import secrets; print(secrets.token_hex(100))'```
-4. Now download the docker-compose.yml file and fill in the environment variables:
-  * SECRET_KEY="your secret key" - generate a secret key by running: ```python3 -c 'import secrets; print(secrets.token_hex(100))'```
-  * GHUSER="your github username"  
-  * GHBEARER="your fine-grained access token"  
-  * ZIP_PASSWORD="the same password that you entered as a github secret"
-  * PROTOCOL="https" *optional - defaults to "https", change to "http" if you need to
-  * REPONAME="rdgen" *optional - defaults to "rdgen", change this if you renamed the repo when you forked it
-5. Now just run ```docker compose up -d```
+4. Copy `.env.example` to `.env` and set `SECRET_KEY`, `GHUSER`, `GHBEARER`,
+   `GENURL`, and `ZIP_PASSWORD`. Use the same `ZIP_PASSWORD` as the repository
+   Actions secret. Generate passwords with
+   `python3 -c 'import secrets; print(secrets.token_hex(100))'`. Set
+   `REPONAME` if you renamed the repository; the default is `rdgen`.
+5. Add optional `WEBDAV_URL`, `WEBDAV_USER`, `WEBDAV_PASS`, and `WEBDAV_DIR`
+   values to `.env` to upload completed installers to a NAS. The build workflows
+   can also use those values from repository Actions secrets.
+6. To enable WeCom notifications, add `WECHAT_WORK_CORP_ID`,
+   `WECHAT_WORK_AGENT_ID`, `WECHAT_WORK_SECRET`, and `WECHAT_WORK_TOUSER` as
+   repository Actions secrets. Notifications are skipped when these are absent.
+7. Start the server with `docker compose up -d --build`. SQLite data, generated
+   installers, and temporary encrypted bundles are persisted in named volumes.
 
 
 ## Use a self hosted github runner for faster client generation (Windows only right now)
@@ -65,12 +70,14 @@
     * give a token name, change expiration to whatever you want  
     * under Repository access, select Only select repositories, then pick your
       rdgen repo  
-    * give Read and Write access to actions and workflows  
+    * give Read and Write access to actions, contents, and workflows
     * You might have to go to: https://github.com/USERNAME/rdgen/actions and hit green Enable Actions button so it works.
 3. Setup environment variables/secrets:
     * environment variables on the server running rdgen:  
         * GHUSER="your github username"  
         * GHBEARER="your fine-grained access token"  
+        * ZIP_PASSWORD="the same password that you entered as a GitHub secret"
+          (also used as the callback token unless `CALLBACK_TOKEN` is set)
         * PROTOCOL="https" *optional - defaults to "https", change to "http" if you need to
         * REPONAME="rdgen" *optional - defaults to "rdgen", change this if you renamed the repo when you forked it
     * github secrets (setup on your github account for your rdgen repo):  

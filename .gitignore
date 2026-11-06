@@ -4,4 +4,8 @@ gunicorn.conf
 .venv
 *.zip
 *.png
-*.zip
+data/
+.env
+
+.coverage
+htmlcov/
