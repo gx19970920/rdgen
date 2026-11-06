@@ -306,6 +306,9 @@
                     {{ form.urlLink }}<br><br>
                     <label for="{{ form.downloadLink.id_for_label }}">Custom URL for downloading updates (replaces https://rustdesk.com/download):</label>
                     {{ form.downloadLink }}<br><br>
+                    <label for="{{ form.update_public_key.id_for_label }}">{{ form.update_public_key.label }}:</label>
+                    {{ form.update_public_key }}
+                    <small>{{ form.update_public_key.help_text }}</small><br><br>
                     <label for="{{ form.compname.id_for_label }}">Company name for copyright (replaces Purslane Tech Pte. Ltd.):</label>
                     {{ form.compname }}<br><br>
             </div>

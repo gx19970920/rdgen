@@ -17,7 +17,7 @@ from django.test import Client, RequestFactory, SimpleTestCase, TestCase, overri
 from PIL import Image
 import pyzipper
 
-from .api_views import api_generate
+from .api_views import api_generate, validate_generate_params
 from .models import GithubRun
 from .views import (
     _is_selfhosted_request,
@@ -120,12 +120,57 @@ class GenerationConfigurationTests(TestCase):
         mock_post.return_value = response
         with tempfile.TemporaryDirectory() as temp_dir, contextlib.chdir(temp_dir):
             result = generate_custom_client(
-                {'exename': 'client', 'platform': 'windows', 'appname': 'Office Remote'},
+                {
+                    'exename': 'client',
+                    'platform': 'windows',
+                    'appname': 'Office Remote',
+                    'serverPort': '24116',
+                    'update_public_key': base64.b64encode(bytes(range(32))).decode('ascii'),
+                },
                 'https://rd.example',
             )
         self.assertTrue(result['success'])
         self.assertEqual(captured['appname'], 'OfficeRemote')
+        self.assertEqual(captured['serverPort'], '24116')
+        self.assertEqual(
+            captured['update_public_key'],
+            base64.b64encode(bytes(range(32))).decode('ascii'),
+        )
         self.assertEqual(json.loads(base64.b64decode(captured['custom']))['app-name'], 'Office Remote')
+
+    @override_settings(
+        ZIP_PASSWORD='test-zip-password',
+        CALLBACK_TOKEN='test-callback-token',
+        GHUSER='owner',
+        REPONAME='repo',
+        GHBEARER='token',
+        GHBRANCH='agent/test',
+    )
+    @patch('rdgenerator.views.requests.post')
+    @patch('rdgenerator.views._upload_input_bundle')
+    def test_server_port_defaults_and_update_public_key_is_optional(
+        self, mock_upload, mock_post,
+    ):
+        captured = {}
+
+        def inspect_bundle(zip_path, _name):
+            with pyzipper.AESZipFile(zip_path) as bundle:
+                bundle.setpassword(b'test-zip-password')
+                captured.update(json.loads(bundle.read('secrets.json')))
+            return 123
+
+        mock_upload.side_effect = inspect_bundle
+        response = Mock(status_code=200, content=b'json')
+        response.json.return_value = {'workflow_run_id': 987}
+        mock_post.return_value = response
+        with tempfile.TemporaryDirectory() as temp_dir, contextlib.chdir(temp_dir):
+            result = generate_custom_client(
+                {'exename': 'client', 'platform': 'windows'},
+                'https://rd.example',
+            )
+        self.assertTrue(result['success'])
+        self.assertEqual(captured['serverPort'], '21116')
+        self.assertEqual(captured['update_public_key'], '')
 
 
 class WorkflowConfigurationTests(SimpleTestCase):
@@ -434,6 +479,51 @@ class ApiValidationTests(SimpleTestCase):
             content_type='application/json',
         )
         self.assertEqual(api_generate(request).status_code, 400)
+
+    def test_generate_validates_and_preserves_update_public_key_and_port(self):
+        public_key = base64.b64encode(bytes(range(32))).decode('ascii')
+        cleaned, errors = validate_generate_params({
+            'exename': 'client',
+            'serverPort': '24116',
+            'update_public_key': public_key,
+        })
+        self.assertEqual(errors, {})
+        self.assertEqual(cleaned['serverPort'], '24116')
+        self.assertEqual(cleaned['update_public_key'], public_key)
+
+    def test_generate_rejects_malformed_update_public_key(self):
+        _, errors = validate_generate_params({
+            'exename': 'client',
+            'update_public_key': 'not-a-public-key',
+        })
+        self.assertIn('update_public_key', errors)
+
+    @patch(
+        'rdgenerator.api_views.generate_custom_client',
+        return_value={
+            'success': True,
+            'uuid': '1aaf014a-bc5a-49d0-97a4-57ea84b331d4',
+            'platform': 'windows',
+            'filename': 'client',
+        },
+    )
+    def test_generate_api_passes_port_and_update_key_to_build(self, mock_generate):
+        public_key = base64.b64encode(bytes(range(32))).decode('ascii')
+        request = self.factory.post(
+            '/api/generate',
+            data=json.dumps({
+                'exename': 'client',
+                'serverPort': '24116',
+                'update_public_key': public_key,
+            }),
+            content_type='application/json',
+            HTTP_HOST='rd.example',
+        )
+        response = api_generate(request)
+        self.assertEqual(response.status_code, 200)
+        params = mock_generate.call_args.args[0]
+        self.assertEqual(params['serverPort'], '24116')
+        self.assertEqual(params['update_public_key'], public_key)
 
 
 class RequestSecurityTests(TestCase):

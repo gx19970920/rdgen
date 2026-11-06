@@ -18,6 +18,12 @@ If you would prefer to build rustdesk on your own computer, check out the [DVFor
 - Custom icon/logo
 - Set default settings for the client
 - Support for rustdesk advanced settings (https://rustdesk.com/docs/en/self-host/client-configuration/advanced-settings/)
+- Configure a custom rendezvous port and an Ed25519 public key for self-hosted updates
+
+The web form and `/api/generate` accept `serverPort` (defaults to `21116`) and
+`update_public_key`. The update key must be a 32-byte Ed25519 public key encoded
+as Base64 or hexadecimal; its matching private key must remain with the update
+signing service and must not be submitted to RDGen.
 
 ## Generate RustDesk clients from command line instead of using a web browser
 

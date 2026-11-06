@@ -299,6 +299,8 @@ def generate_custom_client(params, full_url):
     xOffline = params.get('xOffline', False)
     hidecm = params.get('hidecm', False)
     removeNewVersionNotif = params.get('removeNewVersionNotif', False)
+    serverPort = params.get('serverPort', '') or '21116'
+    update_public_key = params.get('update_public_key', '')
     server = params.get('serverIP', '')
     key = params.get('key', '')
     apiServer = params.get('apiServer', '')
@@ -486,6 +488,7 @@ def generate_custom_client(params, full_url):
 
     inputs_raw = {
         "server":server,
+        "serverPort":serverPort,
         "key":key,
         "apiServer":apiServer,
         "custom":encodedCustom,
@@ -508,6 +511,7 @@ def generate_custom_client(params, full_url):
         "xOffline": 'true' if xOffline else 'false',
         "hidecm": 'true' if hidecm else 'false',
         "removeNewVersionNotif": 'true' if removeNewVersionNotif else 'false',
+        "update_public_key": update_public_key,
         "compname": compname,
         "androidappid":androidappid,
         "filename":filename,

@@ -1,9 +1,10 @@
 """Validate values that existing platform build scripts embed into shell commands."""
+import base64
 import re
 
 BUILD_FIELDS = frozenset({
     'serverIP', 'serverPort', 'key', 'apiServer', 'urlLink', 'downloadLink',
-    'androidappid', 'appname', 'compname', 'app_version',
+    'androidappid', 'appname', 'compname', 'app_version', 'update_public_key',
 })
 # These characters change shell syntax or the sed replacement used by the workflows.
 UNSAFE = re.compile(r"""[&\\|'"\x24\x60\r\n;<>]""")
@@ -21,6 +22,16 @@ def build_parameter_error(field, value):
         return 'Whitespace is not supported in this build parameter.'
     if field == 'app_version' and value and (len(value) > 64 or not APP_VERSION.fullmatch(value)):
         return 'Must be a numeric version such as 1.5.1 or 1.5.1+20.'
+    if field == 'update_public_key' and value:
+        try:
+            key_bytes = base64.b64decode(value, validate=True)
+        except (ValueError, base64.binascii.Error):
+            try:
+                key_bytes = bytes.fromhex(value)
+            except ValueError:
+                return 'Must be a 32-byte Ed25519 public key encoded as Base64 or hex.'
+        if len(key_bytes) != 32:
+            return 'Must be a 32-byte Ed25519 public key encoded as Base64 or hex.'
     if field == 'androidappid' and value and not re.fullmatch(r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+', value, re.ASCII):
         return 'Must be a valid dotted Android application ID.'
     if field == 'serverPort' and value and (not value.isascii() or not value.isdigit() or not 1 <= int(value) <= 65535):

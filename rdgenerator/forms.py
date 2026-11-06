@@ -51,6 +51,11 @@ class GenerateForm(forms.Form):
     key = forms.CharField(label="Key", required=False)
     urlLink = forms.CharField(label="Custom URL for links", required=False)
     downloadLink = forms.CharField(label="Custom URL for downloading new versions", required=False)
+    update_public_key = forms.CharField(
+        label="Update signing public key",
+        required=False,
+        help_text="Optional 32-byte Ed25519 public key in Base64 or hex.",
+    )
     compname = forms.CharField(label="Company name",required=False)
 
     #Visual
@@ -142,6 +147,20 @@ class GenerateForm(forms.Form):
 
     def clean_compname(self):
         return self._reject_unsafe_name_chars('compname')
+
+    def clean_serverPort(self):
+        value = self.cleaned_data.get('serverPort', '')
+        error = build_parameter_error('serverPort', value)
+        if error:
+            raise forms.ValidationError(error)
+        return value
+
+    def clean_update_public_key(self):
+        value = self.cleaned_data.get('update_public_key', '')
+        error = build_parameter_error('update_public_key', value)
+        if error:
+            raise forms.ValidationError(error)
+        return value
 
     def clean(self):
         cleaned = super().clean()
