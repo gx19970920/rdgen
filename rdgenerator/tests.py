@@ -21,8 +21,8 @@ from .api_views import api_generate
 from .models import GithubRun
 from .views import (
     _is_selfhosted_request,
+    _list_run_artifact_files,
     _workflow_dispatch_url,
-    check_for_file,
     cleanup_secrets,
     download,
     generate_custom_client,
@@ -436,7 +436,7 @@ class ApiValidationTests(SimpleTestCase):
         self.assertEqual(api_generate(request).status_code, 400)
 
 
-class RequestSecurityTests(SimpleTestCase):
+class RequestSecurityTests(TestCase):
     def setUp(self):
         self.factory = RequestFactory()
 
@@ -489,7 +489,7 @@ class RequestSecurityTests(SimpleTestCase):
         ):
             response = startgh(request)
             self.assertEqual(response.status_code, 202)
-            self.assertEqual(response.json()['uuid'], run_uuid)
+            self.assertEqual(json.loads(response.content)['uuid'], run_uuid)
             dispatched = mock_post.call_args.kwargs['json']
             inputs = dispatched['inputs']
             self.assertEqual(set(inputs), {
@@ -619,15 +619,41 @@ class DownloadTests(TestCase):
             'github_log_url': 'https://github.example/run',
             'gh_run': self.run,
         }
-        request = self.factory.get('/check_for_file', {
+        response = Client().get('/check_for_file', {
             'filename': 'client',
             'uuid': self.run.uuid,
             'platform': 'windows',
         })
-        response = check_for_file(request)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.context_data['existing_files'], ['client.exe'])
-        self.assertEqual(response.context_data['github_log_url'], 'https://github.example/run')
+        self.assertEqual(response.context['existing_files'], ['client.exe'])
+        self.assertEqual(response.context['github_log_url'], 'https://github.example/run')
+
+    @patch('rdgenerator.views.requests.get')
+    def test_artifact_listing_excludes_encrypted_inputs_and_non_installers(self, mock_get):
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as bundle:
+            bundle.writestr('secrets.zip', b'encrypted-inputs')
+            bundle.writestr('README.txt', b'build metadata')
+            bundle.writestr('output/client.AppImage', b'installer')
+
+        list_response = Mock()
+        list_response.json.return_value = {
+            'artifacts': [{
+                'expired': False,
+                'archive_download_url': 'https://api.github.test/artifact.zip',
+            }]
+        }
+        list_response.raise_for_status.return_value = None
+        archive_response = Mock()
+        archive_response.iter_content.return_value = [archive.getvalue()]
+        archive_response.raise_for_status.return_value = None
+        mock_get.side_effect = [list_response, archive_response]
+
+        with override_settings(GHUSER='owner', REPONAME='repo', GHBEARER='token'):
+            self.assertEqual(
+                _list_run_artifact_files(123),
+                ['client.AppImage'],
+            )
 
 
 class BrandingAssetTests(TestCase):

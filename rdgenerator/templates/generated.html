@@ -128,7 +128,7 @@
         <div class="download-section">
             {% if existing_files %}
                 {% for f in existing_files %}
-                    <a href='/download?filename={{ f }}&uuid={{ uuid }}' class="download-link">Download {{ f }}</a>
+                    <a href='/download?filename={{ f|urlencode }}&uuid={{ uuid|urlencode }}' class="download-link">Download {{ f }}</a>
                 {% endfor %}
             {% else %}
                 <p>No files available for download.</p>

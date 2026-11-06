@@ -230,6 +230,10 @@ def _list_run_artifact_files(run_id):
     response = requests.get(artifacts_url, headers=_github_headers(), timeout=30)
     response.raise_for_status()
     filenames = set()
+    installer_suffixes = (
+        '.exe', '.msi', '.apk', '.dmg', '.deb', '.rpm', '.appimage',
+        '.flatpak', '.pkg.tar.zst',
+    )
     for artifact in response.json().get('artifacts', []):
         if artifact.get('expired') or not artifact.get('archive_download_url'):
             continue
@@ -251,7 +255,8 @@ def _list_run_artifact_files(run_id):
                         if member.is_dir():
                             continue
                         filename = Path(member.filename.replace('\\', '/')).name
-                        if filename and filename not in {'.', '..'}:
+                        if (filename and filename not in {'.', '..'}
+                                and filename.lower().endswith(installer_suffixes)):
                             filenames.add(filename)
             except zipfile.BadZipFile:
                 continue
@@ -907,11 +912,10 @@ def startgh(request):
         'serverPort': data_.get('serverPort', '21116'),
         'key': data_.get('key', ''),
         'apiServer': data_.get('apiServer', ''),
-        'compname': root_values['compname'],
-        'urlLink': root_values['urlLink'],
-        'downloadLink': root_values['downloadLink'],
-        'androidappid': root_values['androidappid'],
-        'app_version': root_values['app_version'],
+        'compname': data_.get('compname', ''),
+        'urlLink': data_.get('urlLink', 'https://rustdesk.com'),
+        'downloadLink': data_.get('downloadLink', 'https://rustdesk.com/download'),
+        'androidappid': data_.get('androidappid', 'com.carriez.flutter_hbb'),
         'app_version': data_.get('app_version', ''),
     }
     for field, value in root_values.items():
@@ -988,7 +992,10 @@ def startgh(request):
             return 'false', 'false', 'false'
         if asset_file != default_name or not isinstance(asset_url, str) or not asset_url:
             return 'false', 'false', 'false'
-        parsed_url = urlsplit(asset_url)
+        try:
+            parsed_url = urlsplit(asset_url)
+        except ValueError:
+            return 'false', 'false', 'false'
         if (parsed_url.scheme not in {'http', 'https'} or not parsed_url.hostname
                 or parsed_url.username or parsed_url.password
                 or parsed_url.query or parsed_url.fragment
@@ -1047,7 +1054,8 @@ def startgh(request):
             'zip_url': zip_url,
             'zip_b64': zip_b64,
             'bundle_asset_id': str(bundle_asset_id or ''),
-        }
+        },
+        'return_run_details': True,
     }
     headers = _github_headers() | {'Content-Type': 'application/json'}
     try:
