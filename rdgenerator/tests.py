@@ -443,14 +443,19 @@ class WeComNotificationTests(SimpleTestCase):
         with patch.object(
             module,
             'urlopen',
-            side_effect=[Response({'errcode': 0, 'access_token': 'token'}), Response({'errcode': 0})],
+            side_effect=[
+                Response({'errcode': 0, 'access_token': 'token'}),
+                Response({'created_at': '2026-11-08T00:00:00Z'}),
+                Response({'errcode': 0}),
+            ],
         ) as mock_urlopen, patch.dict(os.environ, environment, clear=True):
             self.assertTrue(module.send_notification())
 
-        payload = json.loads(mock_urlopen.call_args_list[1].args[0].data.decode('utf-8'))
+        payload = json.loads(mock_urlopen.call_args_list[2].args[0].data.decode('utf-8'))
         self.assertEqual(payload['touser'], 'user-id')
         self.assertEqual(payload['agentid'], 1000006)
         self.assertIn('Windows x64', payload['text']['content'])
+        self.assertIn('耗时：', payload['text']['content'])
         self.assertIn('https://github.test/owner/repo/actions/runs/123', payload['text']['content'])
 
 

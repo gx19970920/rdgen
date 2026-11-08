@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -43,6 +44,34 @@ def request_json(url, payload=None):
     return parsed
 
 
+def build_duration():
+    """Elapsed time from the GitHub run start until this notification."""
+    repository = os.environ.get('GITHUB_REPOSITORY', '')
+    run_id = os.environ.get('GITHUB_RUN_ID', '')
+    if not repository or not run_id:
+        return '未知'
+    headers = {'Accept': 'application/vnd.github+json'}
+    token = os.environ.get('GITHUB_TOKEN', '')
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    request = Request(
+        f'https://api.github.com/repos/{repository}/actions/runs/{run_id}',
+        headers=headers,
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            run = json.load(response)
+        started = run.get('run_started_at') or run['created_at']
+        start = datetime.fromisoformat(started.replace('Z', '+00:00'))
+        seconds = max(0, int((datetime.now(timezone.utc) - start).total_seconds()))
+    except (HTTPError, URLError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+        print(f'::warning::Could not read build duration: {exc}', file=sys.stderr)
+        return '未知'
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f'{hours}小时{minutes}分{seconds}秒' if hours else f'{minutes}分{seconds}秒'
+
+
 def build_message():
     platform = os.environ["WECOM_PLATFORM"]
     version = os.environ["WECOM_VERSION"]
@@ -58,6 +87,7 @@ def build_message():
         f"{status_text}｜RustDesk 自建客户端",
         f"平台：{platform}",
         f"版本：{version}",
+        f"耗时：{build_duration()}",
     ]
     base = os.environ.get('DIST_BASE_URL', '').rstrip('/')
     capability = os.environ.get('DIST_DOWNLOAD_TOKEN', '')

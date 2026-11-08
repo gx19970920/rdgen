@@ -22,4 +22,5 @@ runs:
         WECOM_PLATFORM: ${{ inputs.platform }}
         WECOM_VERSION: ${{ inputs.version }}
         WECOM_STATUS: ${{ inputs.status }}
+        GITHUB_TOKEN: ${{ github.token }}
       run: python "$GITHUB_ACTION_PATH/send_wecom.py"
