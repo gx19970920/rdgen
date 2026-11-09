@@ -453,6 +453,21 @@ jobs:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
           doNotCache: false
 
+      # The pinned vcpkg commit now downloads NASM 3.01, which AOM 3.12.1 rejects.
+      - name: Pin compatible NASM for vcpkg
+        shell: pwsh
+        run: |
+          $tool = 'C:\vcpkg\scripts\cmake\vcpkg_find_acquire_program(NASM).cmake'
+          $source = [System.IO.File]::ReadAllText($tool)
+          $oldVersion = 'set(program_version 3.01)'
+          $oldHash = '771c238ddb17c98d5736ccaba4ade1d1601d896f09e588489cb43a4f6381bc0ae14d1869f5316fe94f847f54867e65cf12665529b1e7ad88e5e7d3e162719a4f'
+          if (-not $source.Contains($oldVersion) -or -not $source.Contains($oldHash)) {
+            throw 'Pinned vcpkg NASM metadata changed; inspect before updating it.'
+          }
+          $source = $source.Replace($oldVersion, 'set(program_version 2.16.03)')
+          $source = $source.Replace($oldHash, '22869ceb70ea0e6597fe06abe205b5d5dd66b41fe54dda73d338c488ba6ef13a39158f25b357616bf578752bb112869ef26ad897eb29352e85cf1ecc61a7c07a')
+          [System.IO.File]::WriteAllText($tool, $source)
+
       - name: Install vcpkg dependencies
         env:
           VCPKG_DEFAULT_HOST_TRIPLET: ${{ matrix.job.vcpkg-triplet }}
