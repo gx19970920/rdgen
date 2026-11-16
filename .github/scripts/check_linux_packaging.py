@@ -24,8 +24,10 @@ VALUES = {
 
 
 def run(bash, script, directory):
-    subprocess.run([bash, "-e", "-c", script], cwd=directory, check=True,
-                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = subprocess.run([bash, "-e", "-c", script], cwd=directory,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode:
+        raise RuntimeError(result.stderr.decode("utf-8", errors="replace"))
 
 
 def main():
@@ -46,7 +48,8 @@ def main():
                 start = source.index('if [ "' + chr(36) + '{{ env.appname }}" != "rustdesk" ]; then')
                 end = source.index("python3 ./build.py", start)
                 blocks.append(re.sub(r"[$][{][{]\s*env[.](\w+)\s*[}][}]",
-                                     lambda m: VALUES[m[1]], "\n".join(preparation) + "\n" + source[start:end]))
+                                     lambda m: VALUES.get(m[1], "false"),
+                                     "\n".join(preparation) + "\n" + source[start:end]))
     assert len(blocks) == 2, "Expected standard and DRM branding blocks"
     for version in ("1.5.0", "1.5.1"):
         def fetch(name):
@@ -62,6 +65,7 @@ def main():
                     target = root / name
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(content, encoding="utf-8", newline="\n")
+                (root / "custom_.txt").write_text("{}", encoding="utf-8")
                 run(bash, block, root)
                 parsed = ast.parse((root / "build.py").read_text(encoding="utf-8"))
                 stage_function = next((node for node in parsed.body

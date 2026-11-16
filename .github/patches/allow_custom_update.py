@@ -14,6 +14,8 @@ Usage:
 
 What it changes:
   1. libs/hbb_common/src/lib.rs        - hardcoded update check URL -> your server
+                                         report the platform name, not a Linux
+                                         distro id ("ubuntu" -> "linux")
                                          get_version_number() -> support +build metadata
   2. src/common.rs                     - allow update checks for custom-branded clients
                                          relax github.com-only host check in
@@ -24,10 +26,17 @@ What it changes:
                                          relax the GitHub-only download host check
   4. src/update_metadata.rs            - add your ed25519 public key to
                                          TRUSTED_UPDATE_KEYS (key id: custom-update)
+  5. Flutter sources                   - remove the is_custom_client() gates around
+                                         the startup check, the update card/banner
+                                         and the "check on startup" toggles
+                                         open the release page instead of a static
+                                         URL where no in-place updater exists
 
 Client contract implemented by the matching update server:
   * POST <downloadLink>/api/version/latest returns a flat {"url": "..."}
     whose path is /rustdesk/rustdesk/releases/tag/<release_id>
+  * GET  <downloadLink>/rustdesk/rustdesk/releases/tag/<release_id>
+    returns an HTML page listing that release's files (used by Linux/Android)
   * The client derives the release id from that path, then fetches
         <downloadLink>/rustdesk/rustdesk/releases/download/<release_id>/rustdesk-update.json
         <downloadLink>/rustdesk/rustdesk/releases/download/<release_id>/rustdesk-update.json.sig
@@ -76,6 +85,31 @@ def change_update_url(root: Path, update_url: str) -> None:
             break
     if not changed:
         print(f"[WARN] {target}: could not find UPDATE_URL pattern to replace")
+
+
+def normalize_update_platform(root: Path) -> None:
+    """Send a platform name instead of a Linux distribution id.
+
+    version_check_request() uses System::distribution_id(), which on Linux is
+    the /etc/os-release ID ("ubuntu", "debian", ...). Update servers that key on
+    "linux" reject those checks as an unsupported platform. Windows, macOS and
+    Android already report std::env::consts::OS.
+    """
+    target = root / "libs" / "hbb_common" / "src" / "lib.rs"
+    if not target.exists():
+        print(f"[WARN] {target} not found, skipping update platform change")
+        return
+
+    text = target.read_text(encoding="utf-8")
+    pattern = re.compile(r"let os = system\.distribution_id\(\);")
+    new_text, n = pattern.subn(
+        "let os = std::env::consts::OS.to_string();", text, count=1
+    )
+    if n > 0:
+        target.write_text(new_text, encoding="utf-8")
+        print(f"[OK] {target}: update checks report the platform name")
+    else:
+        print(f"[WARN] {target}: could not find distribution_id() assignment")
 
 
 def modify_get_version_number(root: Path) -> None:
@@ -226,6 +260,119 @@ def allow_updates_for_custom_clients(root: Path) -> None:
         print(f"[OK] {target}: enabled update checks for custom-branded clients")
     else:
         print(f"[WARN] {target}: could not find is_custom_client() guard in check_software_update()")
+
+
+def _apply_regex(path: Path, pattern: "re.Pattern[str]", replacement: str, label: str) -> None:
+    if not path.exists():
+        print(f"[WARN] {path} not found, skipping {label}")
+        return
+    text = path.read_text(encoding="utf-8")
+    new_text, n = pattern.subn(replacement, text, count=1)
+    if n > 0:
+        path.write_text(new_text, encoding="utf-8")
+        print(f"[OK] {path}: enabled {label}")
+    else:
+        print(f"[WARN] {path}: could not find {label} gate")
+
+
+def _replace_literal(path: Path, old: str, new: str, label: str) -> None:
+    if not path.exists():
+        print(f"[WARN] {path} not found, skipping {label}")
+        return
+    text = path.read_text(encoding="utf-8")
+    if old in text:
+        path.write_text(text.replace(old, new, 1), encoding="utf-8")
+        print(f"[OK] {path}: enabled {label}")
+    else:
+        print(f"[WARN] {path}: could not find {label} gate")
+
+
+def _replace_gate_before(path: Path, marker: str, old: str, new: str, label: str) -> None:
+    """Replace the last `old` that appears before `marker` in the file."""
+    if not path.exists():
+        print(f"[WARN] {path} not found, skipping {label}")
+        return
+    text = path.read_text(encoding="utf-8")
+    marker_idx = text.rfind(marker)
+    gate_idx = text.rfind(old, 0, marker_idx) if marker_idx >= 0 else -1
+    if gate_idx >= 0:
+        new_text = text[:gate_idx] + new + text[gate_idx + len(old):]
+        path.write_text(new_text, encoding="utf-8")
+        print(f"[OK] {path}: enabled {label}")
+    else:
+        print(f"[WARN] {path}: could not find {label} gate")
+
+
+def patch_flutter_update_gates(root: Path) -> None:
+    """Remove the Flutter-side is_custom_client() gates around updates.
+
+    Removing the Rust guard in check_software_update() is not enough: the Dart
+    caller only invokes mainGetSoftwareUpdateUrl() when bind.isCustomClient()
+    is false, so a custom-branded client never contacts the update server at
+    all. The update card, the mobile banner and the "check on startup" toggles
+    are gated the same way.
+    """
+    # Startup check: common.dart checkUpdate()
+    _apply_regex(
+        root / "flutter" / "lib" / "common.dart",
+        re.compile(
+            r"(void\s+checkUpdate\(\)\s*\{\s*if\s*\(!isWeb\)\s*\{\s*)"
+            r"if\s*\(!bind\.isCustomClient\(\)\)\s*\{"
+        ),
+        r"\1if (true) {",
+        "startup update check",
+    )
+
+    # Desktop update card: desktop_home_page.dart buildHelpCards()
+    _apply_regex(
+        root / "flutter" / "lib" / "desktop" / "pages" / "desktop_home_page.dart",
+        re.compile(
+            r"if\s*\(!bind\.isCustomClient\(\)\s*&&\s*updateUrl\.isNotEmpty\s*&&\s*"
+            r"!isCardClosed\s*&&\s*bind\.mainUriPrefixSync\(\)\.contains\('rustdesk'\)\)"
+        ),
+        "if (updateUrl.isNotEmpty && !isCardClosed)",
+        "desktop update card",
+    )
+
+    # Mobile update banner
+    _replace_literal(
+        root / "flutter" / "lib" / "mobile" / "pages" / "connection_page.dart",
+        "if (!bind.isCustomClient() && !isIOS)",
+        "if (!isIOS)",
+        "mobile update banner",
+    )
+
+    # Desktop "Check for software update on startup" toggle
+    _replace_literal(
+        root / "flutter" / "lib" / "desktop" / "pages" / "desktop_setting_page.dart",
+        "if (!isWeb && !bind.isCustomClient())",
+        "if (!isWeb)",
+        "desktop update toggle",
+    )
+
+    # Mobile "Check for software update on startup" toggle
+    _replace_gate_before(
+        root / "flutter" / "lib" / "mobile" / "pages" / "settings_page.dart",
+        "kOptionEnableCheckUpdate",
+        "if (!bind.isCustomClient()) {",
+        "if (true) {",
+        "mobile update toggle",
+    )
+
+    # Platforms without an in-place updater open the release page returned by
+    # the update server, so the user can pick the package for their distro/arch.
+    _replace_literal(
+        root / "flutter" / "lib" / "desktop" / "pages" / "desktop_home_page.dart",
+        "final Uri url = Uri.parse('https://rustdesk.com/download');",
+        "final Uri url = Uri.parse(updateUrl);",
+        "desktop release page button",
+    )
+    _replace_literal(
+        root / "flutter" / "lib" / "mobile" / "pages" / "connection_page.dart",
+        "final url = 'https://rustdesk.com/download';",
+        "final url = updateUrl;",
+        "mobile release page button",
+    )
 
 
 def relax_common_rs(root: Path) -> None:
@@ -546,9 +693,11 @@ def main() -> None:
     print()
 
     change_update_url(root, args.update_url)
+    normalize_update_platform(root)
     modify_get_version_number(root)
     modify_get_version_number_tests(root)
     allow_updates_for_custom_clients(root)
+    patch_flutter_update_gates(root)
     relax_common_rs(root)
     modify_display_version_from_release_id(root)
     modify_display_version_from_release_id_tests(root)

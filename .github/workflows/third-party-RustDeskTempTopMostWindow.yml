@@ -46,7 +46,7 @@ jobs:
         uses: microsoft/setup-msbuild@v3
 
       - name: Checkout Repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - uses: actions/download-artifact@v5
         with:
@@ -92,7 +92,7 @@ jobs:
             msbuild ${{ env.project_path }} -p:Configuration=${{ inputs.configuration }} -p:Platform=${{ inputs.platform }} /p:TargetVersion=${{ inputs.target_version }}
 
       - name: Archive build artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         if: ${{ inputs.upload-artifact }}
         with:
             name: topmostwindow-artifacts

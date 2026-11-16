@@ -31,7 +31,7 @@ jobs:
     steps:
       - name: Checkout source code
         if: ${{ inputs.version != 'master' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: rustdesk/rustdesk
           ref: refs/tags/${{ inputs.version }}
@@ -39,7 +39,7 @@ jobs:
         
       - name: Checkout source code
         if: ${{ inputs.version == 'master' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: rustdesk/rustdesk
           submodules: recursive
@@ -75,7 +75,7 @@ jobs:
           prefix-key: bridge-${{ matrix.job.os }}
 
       - name: Cache cargo git
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/git
           key: bridge-cargo-git-${{ hashFiles('**/Cargo.lock') }}
@@ -84,7 +84,7 @@ jobs:
 
       - name: Cache Bridge
         id: cache-bridge
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /tmp/flutter_rust_bridge
           key: vcpkg-${{ matrix.job.target }}
@@ -120,7 +120,7 @@ jobs:
             cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bridge-artifact
           path: |

@@ -18,8 +18,11 @@ from PIL import Image
 import pyzipper
 
 from .api_views import api_generate, validate_generate_params
+from .forms import GenerateForm
 from .models import GithubRun
 from .views import (
+    get_full_url,
+    _norm_hex_color,
     _is_selfhosted_request,
     _list_run_artifact_files,
     _workflow_dispatch_url,
@@ -797,3 +800,85 @@ class BrandingAssetTests(TestCase):
                 'https://rd.example',
                 'icon.png',
             )
+
+class ThemeColorValidationTests(SimpleTestCase):
+    base = {
+        'platform': 'windows',
+        'version': '1.5.3',
+        'exename': 'client',
+        'direction': 'both',
+        'installation': 'installationY',
+        'settings': 'settingsY',
+        'theme': 'system',
+        'themeDorO': 'default',
+        'passApproveMode': 'password-click',
+        'permissionsType': 'custom',
+    }
+
+    def _form(self, **overrides):
+        data = dict(self.base)
+        data.update(overrides)
+        return GenerateForm(data)
+
+    def test_theme_colors_accept_hash_or_bare_hex(self):
+        form = self._form(themeColor='ff8800', themeSurfaceLight='#FFF6E9')
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.cleaned_data['themeColor'], '#FF8800')
+        self.assertEqual(form.cleaned_data['themeSurfaceLight'], '#FFF6E9')
+
+    def test_blank_theme_color_means_stock(self):
+        form = self._form(themeColor='', themeSurfaceDark='   ')
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.cleaned_data['themeColor'], '')
+        self.assertEqual(form.cleaned_data['themeSurfaceDark'], '')
+
+    def test_bad_theme_color_is_rejected(self):
+        for value in ('red', '#ff880', '#gg8800', '#ff8800ff'):
+            with self.subTest(value=value):
+                form = self._form(themeColor=value)
+                self.assertFalse(form.is_valid())
+                self.assertIn('themeColor', form.errors)
+
+    def test_api_normalizes_theme_colors(self):
+        data = dict(self.base)
+        data.update({
+            'themeColor': 'ff8800',
+            'themeSurfaceLight': '#FFF6E9',
+            'themeSurfaceDark': '',
+            'themeMeColor': '#00AA66',
+        })
+        cleaned, errors = validate_generate_params(data)
+        self.assertEqual(errors, {})
+        self.assertEqual(cleaned['themeColor'], '#FF8800')
+        self.assertEqual(cleaned['themeSurfaceLight'], '#FFF6E9')
+        self.assertEqual(cleaned['themeSurfaceDark'], '')
+        self.assertEqual(cleaned['themeMeColor'], '#00AA66')
+
+    def test_api_rejects_bad_theme_color(self):
+        data = dict(self.base)
+        data['themeMeColor'] = 'green'
+        _, errors = validate_generate_params(data)
+        self.assertIn('themeMeColor', errors)
+
+    def test_norm_hex_color(self):
+        self.assertEqual(_norm_hex_color('ff8800'), '#FF8800')
+        self.assertEqual(_norm_hex_color('#ff8800'), '#FF8800')
+        self.assertEqual(_norm_hex_color(''), '')
+        self.assertEqual(_norm_hex_color('nope'), '')
+
+
+class GetFullUrlTests(SimpleTestCase):
+    def setUp(self):
+        self.request = RequestFactory().get('/', HTTP_HOST='127.0.0.1:8000')
+
+    @override_settings(GENURL='', PROTOCOL='https')
+    def test_uses_request_host_without_genurl(self):
+        self.assertEqual(get_full_url(self.request), 'https://127.0.0.1:8000')
+
+    @override_settings(GENURL='https://rdgen.example.com:4433/', PROTOCOL='https')
+    def test_uses_genurl(self):
+        self.assertEqual(get_full_url(self.request), 'https://rdgen.example.com:4433')
+
+    @override_settings(GENURL='rdgen.example.com:8000', PROTOCOL='http')
+    def test_adds_protocol_to_genurl_without_one(self):
+        self.assertEqual(get_full_url(self.request), 'http://rdgen.example.com:8000')

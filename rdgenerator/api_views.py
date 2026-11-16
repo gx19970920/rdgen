@@ -2,21 +2,20 @@ import json
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.core.exceptions import ValidationError
-from .forms import UNSAFE_NAME_CHARS, GenerateForm
+from .forms import UNSAFE_NAME_CHARS, GenerateForm, HEX_COLOR_RE
 from .build_validation import build_parameter_error
 from .views import generate_custom_client, _get_run_status, _public_base_url
 
 
 # Field validation constraints (mirrored from GenerateForm)
 PLATFORM_CHOICES = ['windows', 'windows-x86', 'linux', 'android', 'macos']
-VERSION_CHOICES = ['master', '1.5.1', '1.5.0']
+VERSION_CHOICES = ['master', '1.5.3', '1.5.1', '1.5.0']
 DIRECTION_CHOICES = ['incoming', 'outgoing', 'both']
 INSTALLATION_CHOICES = ['installationY', 'installationN']
 SETTINGS_CHOICES = ['settingsY', 'settingsN']
 THEME_CHOICES = ['light', 'dark', 'system']
 THEME_DORO_CHOICES = ['default', 'override']
 PASS_APPROVE_MODE_CHOICES = ['password', 'click', 'password-click']
-PERMISSIONS_DORO_CHOICES = ['default', 'override']
 PERMISSIONS_TYPE_CHOICES = ['custom', 'full', 'view']
 
 # Boolean fields
@@ -35,6 +34,9 @@ OPTIONAL_STR_FIELDS = [
     'appname', 'compname', 'androidappid', 'permanentPassword',
     'defaultManual', 'overrideManual',
     'iconbase64', 'logobase64', 'privacybase64',
+    'update_public_key',
+    'app_version',
+    'themeColor', 'themeSurfaceLight', 'themeSurfaceDark', 'themeMeColor',
 ]
 
 
@@ -63,14 +65,16 @@ def validate_generate_params(data):
     # Choice fields
     choice_validations = {
         'platform': (PLATFORM_CHOICES, 'windows'),
-        'version': (VERSION_CHOICES, '1.5.1'),
+        'version': (VERSION_CHOICES, '1.5.3'),
         'direction': (DIRECTION_CHOICES, 'both'),
         'installation': (INSTALLATION_CHOICES, 'installationY'),
         'settings': (SETTINGS_CHOICES, 'settingsY'),
         'theme': (THEME_CHOICES, 'system'),
         'themeDorO': (THEME_DORO_CHOICES, 'default'),
         'passApproveMode': (PASS_APPROVE_MODE_CHOICES, 'password-click'),
-        'permissionsDorO': (PERMISSIONS_DORO_CHOICES, 'default'),
+        # permissionsDorO is no longer used: permissions are always written to
+        # override-settings so they apply to existing installations.  The old
+        # field is still accepted in incoming JSON and simply ignored.
         'permissionsType': (PERMISSIONS_TYPE_CHOICES, 'custom'),
     }
     for field, (choices, default) in choice_validations.items():
@@ -109,6 +113,20 @@ def validate_generate_params(data):
             )
         except ValidationError:
             errors['app_version'] = 'Must be a numeric version such as 1.5.1 or 1.5.1+20.'
+
+    # Theme colors flow into Dart 0xAARRGGBB literals in the workflow patch.
+    # Accept #RRGGBB/RRGGBB and store the canonical form; blank = stock.
+    for field in ('themeColor', 'themeSurfaceLight', 'themeSurfaceDark', 'themeMeColor'):
+        value = cleaned.get(field, '')
+        if not value:
+            continue
+        if not isinstance(value, str) or not HEX_COLOR_RE.match(value.strip()):
+            errors[field] = (
+                'Must be a 6-digit hex color such as #0071FF, or blank for the '
+                'stock RustDesk color.'
+            )
+        else:
+            cleaned[field] = '#' + value.strip().lstrip('#').upper()
 
     # File fields are not used in API mode (base64 fields are used instead)
     cleaned['iconfile'] = None
