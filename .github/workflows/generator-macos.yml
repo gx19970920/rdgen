@@ -111,7 +111,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         
       - uses: actions/download-artifact@v4
         with:
@@ -141,7 +141,7 @@ jobs:
 
       - name: Checkout source code
         if: ${{ env.VERSION != 'master' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
             repository: rustdesk/rustdesk
             ref: refs/tags/${{ env.VERSION }}
@@ -149,7 +149,7 @@ jobs:
   
       - name: Checkout source code
         if: ${{ env.VERSION == 'master' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
             repository: rustdesk/rustdesk
             submodules: recursive
@@ -314,9 +314,17 @@ jobs:
           command: |
             python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'allowCustom.py'), 'allowCustom.py')"
             python allowCustom.py
+            python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'forcePresetPassword.py'), 'forcePresetPassword.py')"
+            python forcePresetPassword.py
             python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'removeSetupServerTip.diff'), 'removeSetupServerTip.diff')"
             git apply removeSetupServerTip.diff
             # sed -i '/intl:/a \ \ archive: ^3.6.1' ./flutter/pubspec.yaml
+
+      - name: apply theme colors
+        shell: bash
+        run: |
+          python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'themeColors.py'), 'themeColors.py')"
+          python themeColors.py
           
       - name: Install build runtime
         run: |
@@ -504,35 +512,26 @@ jobs:
           flutter pub run flutter_launcher_icons
           cd ..
       
-      - name: ui.rs
-        if: ${{ env.iconlink_url != 'false' }}
-        continue-on-error: true
-        shell: bash
-        run: |
-          cp ./src/ui.rs ./src/ui.rs.bak
-          if [ -f "./res/icon.png" ]; then
-            SEARCH_STR="iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAACXBIWXMAAEiuAABIrgHwmhA7AAAAGXRFWHRTb2Z0d2FyZQB3d3cuaW5rc2NhcGUub3Jnm+48GgAAEx9JREFUeJztnXmYHMV5h9"
-            b64=$(base64 < ./res/icon.png)
-            sed -i '' -e "s~$SEARCH_STR.*\"~$b64\"~" ./src/ui.rs
-          fi
-
       - name: fix connection delay
         continue-on-error: false
         if: ${{ env.delayFix == 'true' }}
         shell: bash
         run: |
-          # Precise fix: only extend the direct-connection condition with the
-          # key check, instead of globally replacing !key.is_empty() with
-          # false (which would also disable TCP encryption and UDP logic).
-          sed -i -e 's#if is_local || peer_nat_type == NatType::SYMMETRIC {#if is_local || peer_nat_type == NatType::SYMMETRIC || !key.is_empty() {#' ./src/client.rs
+          # Skip the optional secure_tcp handshake to the rendezvous server.
+          # The open-source rustdesk-server never sends KeyExchange, so when an
+          # access_token is set (third-party API login) the client waits for
+          # READ_TIMEOUT and fails with:
+          # "Failed to secure tcp: deadline has elapsed: Please try later(0)".
+          # Matches DVForge's delay fix. Safe on 1.4.x-1.5.x/master: the only
+          # !key.is_empty() occurrences in client.rs are the two secure_tcp gates.
+          sed -i -e 's|!key.is_empty()|false|' ./src/client.rs
           grep -n "key.is_empty()" ./src/client.rs || true
   
       - name: use X for offline display instead of orange circle
-        continue-on-error: true
         if: env.xOffline == 'true'
         run: |
-          python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'xoffline.diff'), 'xoffline.diff')"
-          git apply xoffline.diff
+          python -c "import os, shutil; shutil.copy2(os.path.join(os.environ['RDGEN_ASSET_DIR'], 'xoffline.py'), 'xoffline.py')"
+          python xoffline.py
 
       - name: hide-cm
         continue-on-error: true
@@ -554,7 +553,7 @@ jobs:
           path: ./
 
       - name: Restore vcpkg installed cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/installed
           key: vcpkg-macos-${{ env.VCPKG_COMMIT_ID }}-${{ matrix.job.vcpkg-triplet }}
@@ -584,7 +583,7 @@ jobs:
           head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
 
       - name: Save vcpkg installed cache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         continue-on-error: true
         with:
           path: ${{ github.workspace }}/installed
@@ -615,8 +614,11 @@ jobs:
         run: |
           APP=$(find ./flutter/build/macos/Build/Products/Release -maxdepth 1 -name "*.app" | head -n 1)
           echo "App bundle: $APP"
-          echo -n '${{ env.custom }}' > "$APP/Contents/MacOS/custom_.txt"
-          ls -l "$APP/Contents/MacOS/custom_.txt"
+          # load_custom_client() on macOS looks in <Contents/MacOS>/../Resources,
+          # i.e. Contents/Resources/custom_.txt — not next to the executable.
+          mkdir -p "$APP/Contents/Resources"
+          echo -n '${{ env.custom }}' > "$APP/Contents/Resources/custom_.txt"
+          ls -l "$APP/Contents/Resources/custom_.txt"
       
       - name: Install rcodesign tool
         if: env.MACOS_P12_BASE64 != null

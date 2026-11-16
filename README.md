@@ -16,6 +16,7 @@ If you would prefer to build rustdesk on your own computer, check out the [DVFor
 - Embed server and key into client
 - Custom app name
 - Custom icon/logo
+- Custom theme colors (accent, light/dark surfaces, ID/“me” color)
 - Set default settings for the client
 - Support for rustdesk advanced settings (https://rustdesk.com/docs/en/self-host/client-configuration/advanced-settings/)
 - Configure a custom rendezvous port and an Ed25519 public key for self-hosted updates
@@ -34,6 +35,8 @@ Save your configuration from the rdgen web interface, or generate your own, then
 - Icons should be square (256x256 recommended)
 - Avoid special characters or non-English characters in app name and file name
 - Build time is currently 30 - 45 minutes
+- Permissions and security settings are written to `override-settings`, so they also apply to machines that already have a saved RustDesk configuration and cannot be changed by the client. The old Default/Override selector for permissions was removed.
+- A permanent password baked into a client is always accepted, even if the machine already has a local permanent password. Setting one also selects permanent-password verification.
 
 ## Optional Synology WebDAV upload
 

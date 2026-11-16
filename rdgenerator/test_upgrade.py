@@ -29,11 +29,11 @@ class VersionTests(SimpleTestCase):
                 self.assertFalse(errors)
                 self.assertEqual(cleaned['version'], version)
 
-    def test_default_version_is_151(self):
+    def test_default_version_is_153(self):
         cleaned, errors = validate_generate_params({'exename': 'client'})
         self.assertFalse(errors)
-        self.assertEqual(cleaned['version'], '1.5.1')
-        self.assertEqual(GenerateForm.base_fields['version'].initial, '1.5.1')
+        self.assertEqual(cleaned['version'], '1.5.3')
+        self.assertEqual(GenerateForm.base_fields['version'].initial, '1.5.3')
 
     def test_api_rejects_unknown_version(self):
         for version in ('1.4.9', '1.5.1;echo unsafe', None, [], {}):
@@ -53,7 +53,7 @@ class VersionTests(SimpleTestCase):
     def test_web_page_includes_151_choice(self):
         response = self.client.get('/')
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, 'value="1.5.1" selected')
+        self.assertContains(response, 'value="1.5.3" selected')
 
 
 @override_settings(ZIP_PASSWORD='test-password', CALLBACK_TOKEN='callback-test',
@@ -78,7 +78,7 @@ class DispatchTests(TestCase):
             with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temp:
                 with contextlib.chdir(temp):
                     result = generate_custom_client(
-                        {'exename': 'verify', 'platform': platform, 'app_version': '1.5.1+20', 'hidecm': True, 'appname': 'OfficeRemote'},
+                        {'exename': 'verify', 'platform': platform, 'version': '1.5.1', 'app_version': '1.5.1+20', 'hidecm': True, 'appname': 'OfficeRemote'},
                         'https://example.test',
                     )
                 self.assertTrue(result['success'])
