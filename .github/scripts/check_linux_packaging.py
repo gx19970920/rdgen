@@ -46,7 +46,8 @@ def main():
                 start = source.index('if [ "' + chr(36) + '{{ env.appname }}" != "rustdesk" ]; then')
                 end = source.index("python3 ./build.py", start)
                 blocks.append(re.sub(r"[$][{][{]\s*env[.](\w+)\s*[}][}]",
-                                     lambda m: VALUES[m[1]], "\n".join(preparation) + "\n" + source[start:end]))
+                                     lambda m: VALUES.get(m[1], "false"),
+                                     "\n".join(preparation) + "\n" + source[start:end]))
     assert len(blocks) == 2, "Expected standard and DRM branding blocks"
     for version in ("1.5.0", "1.5.1"):
         def fetch(name):
