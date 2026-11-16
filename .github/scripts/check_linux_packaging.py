@@ -24,8 +24,10 @@ VALUES = {
 
 
 def run(bash, script, directory):
-    subprocess.run([bash, "-e", "-c", script], cwd=directory, check=True,
-                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = subprocess.run([bash, "-e", "-c", script], cwd=directory,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode:
+        raise RuntimeError(result.stderr.decode("utf-8", errors="replace"))
 
 
 def main():
@@ -63,6 +65,7 @@ def main():
                     target = root / name
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(content, encoding="utf-8", newline="\n")
+                (root / "custom_.txt").write_text("{}", encoding="utf-8")
                 run(bash, block, root)
                 parsed = ast.parse((root / "build.py").read_text(encoding="utf-8"))
                 stage_function = next((node for node in parsed.body
