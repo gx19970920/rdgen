@@ -35,6 +35,25 @@ WEBDAV_URL = os.environ.get('WEBDAV_URL', '')
 WEBDAV_USER = os.environ.get('WEBDAV_USER', '')
 WEBDAV_PASS = os.environ.get('WEBDAV_PASS', '')
 WEBDAV_DIR = os.environ.get('WEBDAV_DIR', '')
+# "json": one JSON object per log line; anything else: the message alone, as before
+LOG_FORMAT = os.environ.get("LOG_FORMAT", "text")
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "text": {"format": "%(message)s"},
+        "json": {"()": "rdgen.jsonlog.JSONFormatter"},
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stdout",
+            "formatter": "json" if LOG_FORMAT.lower() == "json" else "text",
+        },
+    },
+    "loggers": {"rdgenerator": {"handlers": ["console"], "level": "INFO", "propagate": False}},
+}
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')

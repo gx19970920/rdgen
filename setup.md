@@ -36,6 +36,7 @@
    repository Actions secrets. Notifications are skipped when these are absent.
 7. Start the server with `docker compose up -d --build`. SQLite data, generated
    installers, and temporary encrypted bundles are persisted in named volumes.
+   Set `LOG_FORMAT=json` to emit structured application logs.
 
 
 ## Use a self hosted github runner for faster client generation (Windows only right now)
