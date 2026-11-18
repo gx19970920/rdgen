@@ -115,7 +115,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v7
         
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: encrypted-secrets-zip
 
@@ -127,7 +127,7 @@ jobs:
       - name: Finalize and Cleanup zip/json
         if: always() && env.rdgen != 'verify' && env.genurl != ''
         continue-on-error: true
-        uses: fjogeleit/http-request-action@v1
+        uses: fjogeleit/http-request-action@v2
         with:
           url: "${{ env.genurl }}/cleanzip"
           method: 'POST'
@@ -146,7 +146,7 @@ jobs:
           swap-storage: false
 
       - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
@@ -346,7 +346,7 @@ jobs:
       ###########################################################echo "${{ env.iconbase64 }}" | base64 -d > ./res/icon.png
       - name: icon stuff
         if: ${{ env.iconlink_url != 'false' }}
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@v4
         with:
           timeout_minutes: 5
           max_attempts: 3
@@ -530,7 +530,7 @@ jobs:
           sed -i -e 's|https://rustdesk.com/download|${{ env.downloadLink }}|' ./src/ui/index.tis
 
       - name: allow custom.txt
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@v4
         with:
           timeout_minutes: 5
           max_attempts: 3
@@ -573,7 +573,7 @@ jobs:
 
       - name: use X for offline display instead of orange circle
         if: env.xOffline == 'true'
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@v4
         with:
           timeout_minutes: 5
           max_attempts: 3
@@ -585,7 +585,7 @@ jobs:
 
       - name: hide-cm
         if: env.hidecm == 'true'
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@v4
         with:
           timeout_minutes: 5
           max_attempts: 3
@@ -762,7 +762,7 @@ jobs:
 
       - name: send file to rdgen server
         if: ${{ env.rdgen == 'true' }}
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@v4
         with:
           timeout_minutes: 10
           max_attempts: 3
@@ -781,7 +781,7 @@ jobs:
 
       - name: send file to api server
         if: ${{ env.rdgen == 'false' }}
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@v4
         with:
           timeout_minutes: 10
           max_attempts: 3
@@ -797,7 +797,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v7
         
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: encrypted-secrets-zip
 
@@ -809,7 +809,7 @@ jobs:
       - name: Finalize and Cleanup zip/json
         if: always() && env.rdgen != 'verify' && env.genurl != ''
         continue-on-error: true
-        uses: fjogeleit/http-request-action@v1
+        uses: fjogeleit/http-request-action@v2
         with:
           url: "${{ env.genurl }}/cleanzip"
           method: 'POST'
@@ -840,7 +840,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${{ inputs.bundle_asset_id }}"
       - name: Delete secrets artifact
-        uses: geekyeggo/delete-artifact@v5
+        uses: geekyeggo/delete-artifact@v6
         with:
           name: encrypted-secrets-zip
       - name: Notify WeCom

@@ -53,7 +53,7 @@ jobs:
         run: |
           git config user.name 'rdgen upstream sync'
           git config user.email 'rdgen-sync@users.noreply.github.com'
-          git merge --no-ff --no-edit -Xrenormalize "$UPSTREAM_SHA"
+          python .github/scripts/merge_upstream.py "$UPSTREAM_SHA"
           echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
       - name: Test candidate with network isolated
         if: steps.compare.outputs.changed == 'true'
@@ -65,7 +65,11 @@ jobs:
             python -m unittest discover -s distribution -p test_store.py
             python -m unittest discover -s distribution -p test_wecom.py
             python -m unittest discover -s distribution -p test_workflows.py
+            python -m unittest discover -s .github/scripts -p test_merge_upstream.py
           '
+      - name: Validate candidate workflows
+        if: steps.compare.outputs.changed == 'true'
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= -pyflakes=
 
   integrate:
     needs: validate
@@ -93,7 +97,7 @@ jobs:
           git cat-file -e "${UPSTREAM_SHA}^{commit}"
           git config user.name 'rdgen upstream sync'
           git config user.email 'rdgen-sync@users.noreply.github.com'
-          git merge --no-ff --no-edit -Xrenormalize "$UPSTREAM_SHA"
+          python .github/scripts/merge_upstream.py "$UPSTREAM_SHA"
           test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
           if ! git diff --quiet "$BASE_SHA" HEAD -- .github/workflows && [ -z "$UPSTREAM_SYNC_TOKEN" ]; then
             echo '::error::Upstream changed GitHub workflow files. Add repository secret UPSTREAM_SYNC_TOKEN with Contents and Workflows write permissions, then rerun.'

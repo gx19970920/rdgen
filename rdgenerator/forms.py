@@ -1,8 +1,11 @@
+import logging
 import re
 
 from django import forms
 from PIL import Image
 from .build_validation import build_parameter_error
+
+logger = logging.getLogger(__name__)
 
 # App/company names are interpolated into single/double-quoted bash sed
 # scripts in every generator workflow: & \ | corrupt the substitution
@@ -139,7 +142,7 @@ class GenerateForm(forms.Form):
     removeNewVersionNotif = forms.BooleanField(initial=False, required=False)
 
     def clean_iconfile(self):
-        print("checking icon")
+        logger.info("checking icon")
         image = self.cleaned_data['iconfile']
         if image:
             try:

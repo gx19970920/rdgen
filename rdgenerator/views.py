@@ -733,7 +733,7 @@ def _get_run_status(uuid_val):
                     gh_run.status = gh_data['conclusion']
                     gh_run.save()
         except Exception as e:
-            print(f"Error checking GitHub: {e}")
+            logger.warning(f"Error checking GitHub: {e}")
 
     return {
         "found": True,
